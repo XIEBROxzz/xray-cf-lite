@@ -15,7 +15,7 @@
 - 支持 **systemd** 与 **OpenRC**（Alpine）
 - Cloudflare：域名已托管
   - 版本 A：需账号邮箱 + **Global API Key**
-  - 版本 B：无需 Global API Key；固定隧道需 **Cloudflare Tunnel Token**
+  - 版本 B：临时隧道无需任何配置；固定隧道需 Cloudflare **邮箱 + Global API Key**（隧道/DNS 全自动创建）
 
 ## 安装
 
@@ -39,7 +39,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 快捷命令：`sb`
 
 - 内核 **sing-box**，协议 VLESS-WS / Trojan-WS
-- 支持 **临时隧道**（随机域名，重启失效）与 **固定隧道**（Token，自定义域名，持久）
+- 支持 **临时隧道**（随机域名，重启失效）与 **固定隧道**（邮箱 + Global API Key，全自动部署，自定义域名，持久）
+- 固定隧道部署全自动：自动创建隧道（隧道名 = 二级域名前缀）、云端入口统一 `http://127.0.0.1:8080`、自动添加 DNS 解析；删除/卸载时自动清理
 - 后台守护（Watchdog）自动修复失效隧道
 
 | | 版本 A | 版本 B |
@@ -48,7 +49,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 | 接入方式 | DNS + Origin Rules | cloudflared 隧道（Argo） |
 | 公网 IP | 需要 | 不需要 |
 | 端口映射（NAT） | 需要 | 不需要 |
-| 监听端口 | 随机 / 手动 | 随机 / 手动 |
+| 监听端口 | 随机 / 手动 | 随机（临时）/ 8080 固定（固定隧道） |
 | 协议 | VLESS | VLESS-WS / Trojan-WS |
 | 快捷命令 | `x` | `sb` |
 
@@ -59,9 +60,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 ### 主要能力
 
 - **Argo 临时隧道**：无需配置，随机 `trycloudflare.com` 域名，不稳定，重启失效。
-- **Argo 固定隧道**：需 Cloudflare Tunnel Token，自定义域名，稳定持久，重启不失效。
+- **Argo 固定隧道**：只需 Cloudflare 邮箱 + Global API Key，全自动部署——自动创建命名隧道（隧道名 = 二级域名前缀，如 `abc.example.com` → `abc`）、云端 ingress 统一指向 `http://127.0.0.1:8080`、自动创建 DNS CNAME（橙云 proxied），稳定持久，重启不失效。
 - 支持 VLESS-WS 与 Trojan-WS 两种节点协议。
 - 节点查看、删除、重启、日志查看。
+- 删除节点 / 卸载 Argo / 卸载脚本时，自动同步删除 Cloudflare 云端隧道与 DNS 记录。
 - 后台守护（Watchdog）：每分钟检查并自动修复失效隧道。
 - 临时域名 DNS 发布校验、Early Data 同步、分享链接生成与持久化。
 - 前置支持：依赖安装、sing-box 核心安装（SHA-256 校验 + 失败回滚）、cloudflared 安装、systemd / OpenRC / direct 三种服务管理、配置初始化与自愈。
@@ -104,7 +106,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 创建节点时可选隧道模式：
 
 - **临时隧道**：无需配置，随机域名，不稳定，重启失效。
-- **固定隧道**：需 Token，自定义域名，稳定持久，重启不失效。需去 Cloudflare Dashboard 配置 Public Hostname 指向 `http://localhost:<端口>`。
+- **固定隧道**：输入 Cloudflare 邮箱 + Global API Key + 绑定域名，脚本自动完成全部部署（创建隧道、写入口 `http://127.0.0.1:8080`、添加 DNS 解析），稳定持久，重启不失效。删除或卸载时自动删除隧道的 DNS 记录。
 
 ### 配置与数据位置
 
@@ -117,6 +119,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 | `/usr/local/etc/sing-box/relay.json` | 中转配置 |
 | `/usr/local/etc/sing-box/clash.yaml` | Clash/Mihomo 客户端配置 |
 | `/usr/local/etc/sing-box/argo_metadata.json` | Argo 节点元数据与分享链接 |
+| `/usr/local/etc/sing-box/cf_account.json` | Cloudflare 凭据（邮箱 / Global API Key，用于固定隧道自动部署与卸载清理） |
 | `/var/log/sing-box.log` | sing-box 日志 |
 | `/var/log/singbox_argo_*.log` | Argo 隧道日志 |
 
