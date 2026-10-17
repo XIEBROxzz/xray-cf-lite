@@ -430,12 +430,17 @@ start_cloudflared() {
         rc-update add cloudflared default &>/dev/null || true
         rc-service cloudflared restart
     fi
+
+    # 安装服务级兜底（cron 每分钟 restart），并在启动后确认一次
+    install_cloudflared_watchdog || true
+
     sleep 3
-    is_active_cloudflared && ok "cloudflared 已启动" || {
-        echo "cloudflared 启动异常，最近日志：" >&2
+    if is_active_cloudflared; then
+        ok "cloudflared 已启动"
+    else
+        echo "cloudflared 首次启动未就绪（可能网络尚未可用），将由兜底 cron 自动重启。" >&2
         tail -n 20 /var/log/cloudflared.log 2>/dev/null >&2 || true
-        die "cloudflared 启动失败（token 无效或网络被拒）"
-    }
+    fi
 }
 
 stop_cloudflared() {
@@ -455,7 +460,7 @@ stop_cloudflared() {
         done
     fi
     rm -f "$CLOUDFLARED_PID" "$CLOUDFLARED_TOKEN_FILE"
-    rm -f /usr/local/bin/singbox-cf-keepalive
+    remove_cloudflared_watchdog
 }
 
 is_active_cloudflared() {
@@ -464,6 +469,48 @@ is_active_cloudflared() {
     else
         rc-service cloudflared status &>/dev/null 2>&1
     fi
+}
+
+# 服务级兜底：写 cron 每分钟检测，服务没在跑就「重启服务」（而非拉进程）
+# 这是对付「开机时网络未就绪导致服务起来就退出」最可靠的手段。
+install_cloudflared_watchdog() {
+    # 写独立 keepalive 脚本
+    local ks="/usr/local/bin/singbox-cf-keepalive"
+    cat > "$ks" <<'KEOF'
+#!/bin/sh
+# cloudflared 服务级兜底：检测服务未运行则重启服务
+INIT=""
+if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+    INIT="systemd"
+elif command -v rc-service >/dev/null 2>&1; then
+    INIT="openrc"
+fi
+BIN="/usr/local/bin/cloudflared"
+TOKEN_FILE="/etc/sing-box-cf-tunnel/tunnel_token"
+[ -x "$BIN" ] || exit 0
+[ -f "$TOKEN_FILE" ] || exit 0
+if [ "$INIT" = "systemd" ]; then
+    systemctl is-active cloudflared >/dev/null 2>&1 && exit 0
+    systemctl restart cloudflared >/dev/null 2>&1
+else
+    rc-service cloudflared status >/dev/null 2>&1 && exit 0
+    rc-service cloudflared restart >/dev/null 2>&1
+fi
+KEOF
+    chmod 700 "$ks"
+
+    # 确保 cron 可用并写任务
+    command -v crontab >/dev/null 2>&1 || return 1
+    local job="* * * * * $ks >/dev/null 2>&1"
+    crontab -l 2>/dev/null | grep -Fq "singbox-cf-keepalive" && return 0
+    (crontab -l 2>/dev/null; echo "$job") | crontab - 2>/dev/null && \
+        info "已启用服务级兜底 (cron 每分钟检测并 restart cloudflared)"
+}
+
+remove_cloudflared_watchdog() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -Fv "singbox-cf-keepalive" | crontab - 2>/dev/null || true
+    rm -f /usr/local/bin/singbox-cf-keepalive
 }
 
 # ── sing-box 配置 ──────────────────────────────────────
