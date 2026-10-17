@@ -1160,12 +1160,16 @@ do_restart() {
 # ── 主入口 ────────────────────────────────────────────
 ensure_shortcut() {
     local target="/usr/local/bin/x"
-    [[ -f "$target" ]] && return
+    # 已指向本仓库则跳过；否则（旧版/指向别处）一律重写，避免一直拉到旧脚本
+    if [[ -f "$target" ]] && grep -q "XIEBROxzz/xray-cf-lite" "$target"; then
+        return
+    fi
     cat > "$target" << 'SCEOF'
 #!/bin/sh
 exec bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_lite.sh) "$@"
 SCEOF
     chmod +x "$target"
+    ok "快捷命令 x 已更新指向本仓库"
 }
 
 main() {
