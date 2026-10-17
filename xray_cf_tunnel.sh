@@ -13,10 +13,11 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_CONFIG="$SINGBOX_DIR/config.json"
 SINGBOX_BINARY="/usr/local/bin/sing-box"
 CLOUDFLARED_BINARY="/usr/local/bin/cloudflared"
-CLOUDFLARED_CONFIG="/etc/cloudflared/config.yml"
 STATE_DIR="/etc/sing-box-cf-tunnel"
 STATE_PATH="$STATE_DIR/state.json"
 CF_ACCOUNT_PATH="$STATE_DIR/cf_account.json"
+CLOUDFLARED_PID="$STATE_DIR/cloudflared.pid"
+CLOUDFLARED_LOG="$STATE_DIR/cloudflared.log"
 LAST_LINKS_PATH="$(pwd)/cf_tunnel_last_links.txt"
 SINGBOX_LISTEN_PORT="8080"
 
@@ -257,30 +258,15 @@ cf_create_tunnel() {
         | jq -r '.result | "\(.id) \(.token)"'
 }
 
-# ── 本地 cloudflared config.yml（token + 完整 ingress）──
-# 关键：token 方式的隧道是「本地托管」，ingress 必须写在本地 config，
-# 否则 cloudflared 只建立连接、没有路由规则，隧道不生效。
-write_cloudflared_config() {
-    local token="$1" domain="$2" port="$3"
-    mkdir -p "$(dirname "$CLOUDFLARED_CONFIG")"
-    if [[ -z "$token" ]]; then
-        # 复用已有 token（保留原 config 中的 tunnel 行），仅更新 ingress
-        local old_token=""
-        if [[ -f "$CLOUDFLARED_CONFIG" ]]; then
-            old_token=$(grep -E '^tunnel:' "$CLOUDFLARED_CONFIG" 2>/dev/null | awk '{print $2}' | head -n1)
-        fi
-        token="$old_token"
-    fi
-    [[ -n "$token" ]] || die "缺少 cloudflared tunnel token"
-
-    cat > "$CLOUDFLARED_CONFIG" <<EOF
-tunnel: $token
-ingress:
-  - hostname: $domain
-    service: http://127.0.0.1:$port
-  - service: http_status:404
-EOF
-    chmod 600 "$CLOUDFLARED_CONFIG"
+# ── 隧道 ingress（远程托管隧道：写到云端）──────────
+# 关键：API 创建的隧道是 remotely-managed 隧道，ingress 必须
+# 通过 API 写到云端，cloudflared 用 --token 运行时从云端拉取。
+# 不要用本地 config.yml 写 ingress（那只对 locally-managed 有效）。
+cf_set_ingress() {
+    local tunnel_id="$1" domain="$2" port="$3"
+    cf_call PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$tunnel_id/configurations" \
+        "$(jq -n --arg h "$domain" --argjson p "$port" \
+          '{config:{ingress:[{hostname:$h, service:("http://127.0.0.1:" + ($p|tostring))}, {service:"http_status:404"}]}}')" >/dev/null
 }
 
 cf_ensure_cname() {
@@ -376,22 +362,118 @@ is_active_singbox() {
     fi
 }
 
-restart_cloudflared() {
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        systemctl restart cloudflared
-    else
-        rc-service cloudflared restart
+# ── cloudflared 进程管理（nohup + PID + watchdog）──────
+# 关键：cloudflared 的 `service install` 依赖 systemd/sysvinit，
+# 在 OpenRC / 精简容器环境不生效。改为 nohup 后台运行 + PID 文件，
+# 由 crontab watchdog 每分钟 keepalive 保证持久。
+is_cloudflared_running() {
+    local pid=""
+    [[ -f "$CLOUDFLARED_PID" ]] && pid=$(cat "$CLOUDFLARED_PID" 2>/dev/null)
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+start_cloudflared() {
+    local token="$1"
+    [[ -n "$token" ]] || die "缺少 cloudflared tunnel token"
+    mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+
+    # 已运行则跳过
+    if is_cloudflared_running; then
+        info "cloudflared 已在运行 (PID: $(cat "$CLOUDFLARED_PID"))"
+        return 0
     fi
+
+    info "启动 cloudflared 隧道 ..."
+    # --protocol http2 避免 QUIC/UDP 被阻断；--no-autoupdate 防止自更新挂起
+    nohup "$CLOUDFLARED_BINARY" tunnel --protocol http2 --no-autoupdate run --token "$token" \
+        >> "$CLOUDFLARED_LOG" 2>&1 &
+    local cf_pid=$!
+    echo "$cf_pid" > "$CLOUDFLARED_PID"
+    chmod 600 "$CLOUDFLARED_PID" 2>/dev/null || true
+
+    sleep 5
+    if ! kill -0 "$cf_pid" 2>/dev/null; then
+        echo "cloudflared 启动后立即退出，最近日志：" >&2
+        tail -n 20 "$CLOUDFLARED_LOG" 2>/dev/null >&2 || true
+        rm -f "$CLOUDFLARED_PID"
+        die "cloudflared 启动失败（token 无效或网络被拒）"
+    fi
+    enable_cloudflared_watchdog
+    ok "cloudflared 已启动 (PID: $cf_pid)"
 }
 
 stop_cloudflared() {
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        systemctl stop cloudflared &>/dev/null 2>&1 || true
-        systemctl disable cloudflared &>/dev/null 2>&1 || true
-    else
-        rc-service cloudflared stop &>/dev/null 2>&1 || true
-        rc-update del cloudflared default &>/dev/null 2>&1 || true
+    local pid=""
+    [[ -f "$CLOUDFLARED_PID" ]] && pid=$(cat "$CLOUDFLARED_PID" 2>/dev/null)
+    # 清理所有 cloudflared 进程（含可能残留的无 PID 进程）
+    if pgrep -f "$CLOUDFLARED_BINARY" &>/dev/null 2>&1; then
+        pkill -f "$CLOUDFLARED_BINARY" 2>/dev/null || true
+        sleep 1
     fi
+    rm -f "$CLOUDFLARED_PID"
+    disable_cloudflared_watchdog
+}
+
+is_active_cloudflared() {
+    is_cloudflared_running
+}
+
+# keepalive：cron 每分钟调用，进程挂了就拉起
+cloudflared_keepalive() {
+    if is_cloudflared_running; then
+        return 0
+    fi
+    # 从 state.json 读取保存的 token
+    local token=""
+    if [[ -f "$STATE_PATH" ]]; then
+        token=$(jq -r '.token // empty' "$STATE_PATH" 2>/dev/null)
+    fi
+    [[ -n "$token" ]] || return 0
+    mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+    nohup "$CLOUDFLARED_BINARY" tunnel --protocol http2 --no-autoupdate run --token "$token" \
+        >> "$CLOUDFLARED_LOG" 2>&1 &
+    echo "$!" > "$CLOUDFLARED_PID"
+    chmod 600 "$CLOUDFLARED_PID" 2>/dev/null || true
+}
+
+enable_cloudflared_watchdog() {
+    command -v crontab &>/dev/null || return 1
+    # 写入独立 keepalive 脚本（不依赖主脚本文件路径，兼容 bash <(curl) 执行方式）
+    local ks="/usr/local/bin/singbox-cf-keepalive"
+    cat > "$ks" <<'KEOF'
+#!/bin/sh
+# cloudflared keepalive: 进程挂了自动拉起
+PID_FILE="/etc/sing-box-cf-tunnel/cloudflared.pid"
+STATE_PATH="/etc/sing-box-cf-tunnel/state.json"
+LOG_FILE="/etc/sing-box-cf-tunnel/cloudflared.log"
+BIN="/usr/local/bin/cloudflared"
+[ -x "$BIN" ] || exit 0
+# 已运行则跳过
+if [ -f "$PID_FILE" ]; then
+    p=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        exit 0
+    fi
+fi
+token=$(jq -r '.token // empty' "$STATE_PATH" 2>/dev/null)
+[ -n "$token" ] || exit 0
+mkdir -p "$(dirname "$PID_FILE")" 2>/dev/null
+nohup "$BIN" tunnel --protocol http2 --no-autoupdate run --token "$token" >> "$LOG_FILE" 2>&1 &
+echo $! > "$PID_FILE"
+chmod 600 "$PID_FILE" 2>/dev/null
+KEOF
+    chmod 700 "$ks"
+
+    local job="* * * * * $ks >/dev/null 2>&1"
+    crontab -l 2>/dev/null | grep -Fq "singbox-cf-keepalive" && return 0
+    (crontab -l 2>/dev/null; echo "$job") | crontab - 2>/dev/null && \
+        info "已启用 cloudflared 看门狗 (cron 每分钟 keepalive)"
+}
+
+disable_cloudflared_watchdog() {
+    command -v crontab &>/dev/null || return 1
+    crontab -l 2>/dev/null | grep -Fv "singbox-cf-keepalive" | crontab - 2>/dev/null || true
+    rm -f /usr/local/bin/singbox-cf-keepalive
 }
 
 # ── sing-box 配置 ──────────────────────────────────────
@@ -479,9 +561,9 @@ do_install() {
     [[ -n "$tunnel_id" && -n "$token" ]] || die "创建隧道失败"
     ok "隧道已创建: $tunnel_id ($tunnel_name)"
 
-    # 2) 配置入口（本地 config.yml）+ CNAME
+    # 2) 配置入口（云端 ingress）+ CNAME 自动解析
     info "配置隧道入口 ..."
-    write_cloudflared_config "$token" "$domain" "$port"
+    cf_set_ingress "$tunnel_id" "$domain" "$port"
     cf_ensure_cname "$zone_id" "$domain" "$tunnel_id"
     ok "入口已配置: $domain -> http://127.0.0.1:$port"
 
@@ -493,20 +575,16 @@ do_install() {
     restart_singbox
     ok "sing-box 已启动"
 
-    # 4) cloudflared 服务（使用本地 config.yml，含 token + ingress）
-    info "安装 cloudflared 服务 ..."
+    # 4) cloudflared（nohup 后台运行 + token + watchdog）
+    info "安装 cloudflared ..."
     install_cloudflared
-    "$CLOUDFLARED_BINARY" service install --config "$CLOUDFLARED_CONFIG" 2>/dev/null \
-        || "$CLOUDFLARED_BINARY" service install 2>/dev/null \
-        || die "cloudflared 服务安装失败"
-    restart_cloudflared
-    ok "cloudflared 已启动"
+    start_cloudflared "$token"
 
     # 5) 节点链接
     local link; link=$(build_link "$uid" "$domain" "$path")
     save_links_snapshot "$domain" "$uid" "$link"
-    save_state "$(jq -n --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg tid "$tunnel_id" --argjson p "$port" --arg pa "$path" --arg l "$link" \
-        '{domain:$d,zone_id:$z,uuid:$u,tunnel_id:$tid,port:$p,path:$pa,link:$l}')"
+    save_state "$(jq -n --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg tid "$tunnel_id" --arg tok "$token" --argjson p "$port" --arg pa "$path" --arg l "$link" \
+        '{domain:$d,zone_id:$z,uuid:$u,tunnel_id:$tid,token:$tok,port:$p,path:$pa,link:$l}')"
 
     echo
     ok "部署完成"
@@ -527,9 +605,9 @@ do_uninstall() {
     echo "正在卸载: $domain"
 
     if command -v cloudflared &>/dev/null; then
-        cloudflared service uninstall &>/dev/null 2>&1 || true
+        "$CLOUDFLARED_BINARY" service uninstall &>/dev/null 2>&1 || true
         stop_cloudflared
-        ok "cloudflared 已停止并卸载服务"
+        ok "cloudflared 已停止"
     fi
 
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -561,7 +639,7 @@ do_uninstall() {
         echo "无 CF 凭据，跳过隧道删除"
     fi
 
-    rm -f "$STATE_PATH" "$CF_ACCOUNT_PATH" "$LAST_LINKS_PATH" "$CLOUDFLARED_CONFIG"
+    rm -f "$STATE_PATH" "$CF_ACCOUNT_PATH" "$LAST_LINKS_PATH" "$CLOUDFLARED_PID" "$CLOUDFLARED_LOG"
     ok "卸载完成"
 }
 
@@ -635,15 +713,19 @@ do_modify() {
     ok "sing-box 已重启"
 
     if load_cf_account; then
-        write_cloudflared_config "" "$domain" "$port"
-        restart_cloudflared
+        cf_set_ingress "$tunnel_id" "$domain" "$port"
+        # 重启 cloudflared 进程（重新从云端拉取 ingress）
+        local token; token=$(echo "$state" | jq -r '.token // empty')
+        stop_cloudflared
+        start_cloudflared "$token" 2>/dev/null || true
         ok "隧道入口已更新"
     fi
 
     local link; link=$(build_link "$uid" "$domain" "$path")
     save_links_snapshot "$domain" "$uid" "$link"
-    save_state "$(jq -n --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg tid "$tunnel_id" --argjson p "$port" --arg pa "$path" --arg l "$link" \
-        '{domain:$d,zone_id:$z,uuid:$u,tunnel_id:$tid,port:$p,path:$pa,link:$l}')"
+    local tok; tok=$(echo "$state" | jq -r '.token // empty')
+    save_state "$(jq -n --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg tid "$tunnel_id" --arg tok "$tok" --argjson p "$port" --arg pa "$path" --arg l "$link" \
+        '{domain:$d,zone_id:$z,uuid:$u,tunnel_id:$tid,token:$tok,port:$p,path:$pa,link:$l}')"
 
     echo
     ok "配置已更新"
@@ -654,7 +736,10 @@ do_modify() {
 do_restart() {
     restart_singbox
     ok "sing-box 已重启"
-    restart_cloudflared
+    local state; state=$(load_state 2>/dev/null || true)
+    local token=""; [[ -n "$state" ]] && token=$(echo "$state" | jq -r '.token // empty')
+    stop_cloudflared
+    [[ -n "$token" ]] && start_cloudflared "$token"
     ok "cloudflared 已重启"
 }
 
@@ -668,7 +753,7 @@ do_status() {
     echo "隧道: $(echo "$state" | jq -r '.tunnel_id')"
     echo
     echo -n "sing-box:    "; is_active_singbox && echo "运行中" || echo "未运行"
-    echo -n "cloudflared: "; if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl is-active cloudflared &>/dev/null && echo "运行中" || echo "未运行"; else rc-service cloudflared status &>/dev/null 2>&1 && echo "运行中" || echo "未运行"; fi
+    echo -n "cloudflared: "; is_active_cloudflared && echo "运行中 (PID: $(cat "$CLOUDFLARED_PID" 2>/dev/null))" || echo "未运行"
     echo
     print_link "$(echo "$state" | jq -r '.link')"
 }
@@ -688,6 +773,12 @@ exec bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/
 }
 
 main() {
+    # keepalive 子命令：cron 每分钟调用，静默守护 cloudflared
+    if [[ "${1:-}" == "keepalive" ]]; then
+        cloudflared_keepalive
+        exit 0
+    fi
+
     [[ "$(id -u)" == "0" ]] || die "请使用 root 运行此脚本"
     detect_init
     install_deps
