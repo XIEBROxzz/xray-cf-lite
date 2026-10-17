@@ -16,6 +16,7 @@ LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="xray-cf-lite "
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+PREFERRED_SUB_BASE="https://sub.eooce.xx.kg"
 
 declare -A PROTO_SUFFIX=([vless]="vl")
 declare -A PROTO_LABEL=([vless]="VLESS")
@@ -882,13 +883,57 @@ do_uninstall() {
 }
 
 # ── 3. 查看节点 ──────────────────────────────────────
-do_show() {
+# 取节点链接：优先订阅快照，其次 state
+get_node_link() {
+    if [[ -f "$LAST_LINKS_PATH" ]]; then
+        local link
+        link=$(awk '/^vless /{sub(/^vless /,""); print; exit}' "$LAST_LINKS_PATH")
+        [[ -n "$link" ]] && { echo "$link"; return 0; }
+    fi
+    local state; state=$(load_state 2>/dev/null || true)
+    [[ -n "$state" ]] || return 1
+    echo "$state" | jq -r '.links | to_entries[0].value // empty'
+}
+
+print_node_links() {
     if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "无历史节点"
     echo "域名: $(echo "$state" | jq -r '.domain')"
     echo "UUID: $(echo "$state" | jq -r '.uuid')"
     echo "$state" | jq -r '.links | to_entries[] | "\(.key) \(.value)"'
+}
+
+# 生成优选订阅：调用第三方优选服务（节点信息会提交到该服务）
+gen_preferred_sub() {
+    local node_link
+    node_link=$(get_node_link) || die "未找到节点链接"
+    echo
+    info "生成优选订阅（需联网访问第三方服务）..."
+    echo
+    echo "  ⚠️  注意：节点信息会提交到第三方服务（$PREFERRED_SUB_BASE）"
+    echo
+    echo "优选订阅:"
+    echo "  ${PREFERRED_SUB_BASE}/sub?link=$(urlencode "$node_link")"
+    echo
+    echo "用法: 把上面链接填进客户端订阅，客户端会自动优选最快 IP"
+}
+
+do_show() {
+    local state; state=$(load_state 2>/dev/null || true)
+    [[ -n "$state" || -f "$LAST_LINKS_PATH" ]] || die "无历史节点"
+
+    echo
+    echo "  1. 查看节点链接"
+    echo "  2. 生成优选订阅"
+    echo "  0. 返回"
+    echo
+    read -rp "请选择 [0-2]: " sc
+    case "$sc" in
+        1) print_node_links ;;
+        2) gen_preferred_sub ;;
+        *) return ;;
+    esac
 }
 
 # ── 4. 修改配置 ──────────────────────────────────────
@@ -1191,7 +1236,7 @@ main() {
     echo
     echo "  1. 安装节点"
     echo "  2. 卸载"
-    echo "  3. 查看节点"
+    echo "  3. 查看节点/优选订阅"
     echo "  4. 修改配置(UUID/端口/路径)"
     echo "  5. 查看当前配置"
     echo "  6. 更新外部端口(NAT换端口)"
