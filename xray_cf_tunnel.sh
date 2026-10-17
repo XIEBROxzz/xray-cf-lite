@@ -2,15 +2,16 @@
 set -euo pipefail
 
 # ============================================================
-#  xray-cf-tunnel.sh — 一键 Cloudflare Tunnel (Argo) 节点部署
+#  xray_cf_tunnel.sh — 一键 Cloudflare Tunnel (Argo) 节点部署
+#  内核: sing-box   协议: VLESS + WebSocket
 #  无需公网 IP / 端口映射，cloudflared 隧道主动连 CF
-#  单节点 VLESS + WebSocket，走 CF 边缘（橙云效果）
+#  内核下载参考 singbox-lite：GitHub API + wget + SHA256 校验
 # ============================================================
 
 # ── 常量 ──────────────────────────────────────────────
-XRAY_CONFIG_DIR="/usr/local/etc/xray"
-XRAY_CONFIG_PATH="$XRAY_CONFIG_DIR/config.json"
-XRAY_BINARY="/usr/local/bin/xray"
+SINGBOX_DIR="/usr/local/etc/sing-box"
+SINGBOX_CONFIG="$SINGBOX_DIR/config.json"
+SINGBOX_BINARY="/usr/local/bin/sing-box"
 CLOUDFLARED_BINARY="/usr/local/bin/cloudflared"
 STATE_DIR="/etc/xray-cf-tunnel"
 STATE_PATH="$STATE_DIR/state.json"
@@ -19,7 +20,6 @@ LAST_LINKS_PATH="$(pwd)/cf_tunnel_last_links.txt"
 TUNNEL_NAME="xray-cf-tunnel"
 
 CF_API="https://api.cloudflare.com/client/v4"
-XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
 # ── 工具 ──────────────────────────────────────────────
 die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -39,6 +39,15 @@ urlencode() {
 
 gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
 
+sha256_of() {
+    local f="$1"
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$f" | awk '{print $1}'
+    else
+        openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}'
+    fi
+}
+
 # ── init 系统检测 ─────────────────────────────────────
 INIT_SYSTEM=""
 detect_init() {
@@ -57,59 +66,103 @@ install_deps() {
     command -v curl    &>/dev/null || missing+=(curl)
     command -v jq      &>/dev/null || missing+=(jq)
     command -v openssl &>/dev/null || missing+=(openssl)
+    command -v wget    &>/dev/null || missing+=(wget)
+    command -v tar     &>/dev/null || missing+=(tar)
     [[ ${#missing[@]} -eq 0 ]] && return
     echo "安装依赖: ${missing[*]}"
     if command -v apk &>/dev/null; then
-        apk add --no-cache "${missing[@]}"
+        apk add --no-cache "${missing[@]}" ca-certificates
     elif command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y -qq "${missing[@]}"
+        apt-get update -qq && apt-get install -y -qq "${missing[@]}" ca-certificates
     elif command -v yum &>/dev/null; then
-        yum install -y "${missing[@]}"
+        yum install -y "${missing[@]}" ca-certificates
     else
         die "无法安装依赖 ${missing[*]}"
     fi
 }
 
-get_arch() {
+arch_tag() {
     case "$(uname -m)" in
         x86_64|amd64)  echo "amd64" ;;
         aarch64|arm64) echo "arm64" ;;
+        armv7l)        echo "armv7" ;;
         armv7*)        echo "arm" ;;
         *)             die "不支持的架构: $(uname -m)" ;;
     esac
 }
 
-# ── 安装 xray ─────────────────────────────────────────
-install_xray() {
-    echo "正在安装 xray-core ..."
-    # 优先官方安装脚本（会创建 systemd 服务）
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        if bash -c "curl -fsSL $XRAY_INSTALL_URL | bash -s -- install" 2>/dev/null; then
-            [[ -f "$XRAY_BINARY" ]] && { ok "xray-core 安装完成"; return; }
-        fi
+# ── 安装 sing-box（参考 singbox-lite 的稳健下载）──────
+install_singbox() {
+    info "正在安装 sing-box ..."
+    local arch; arch=$(arch_tag)
+    local libc_suffix=""
+    if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then
+        libc_suffix="-musl"
     fi
-    info "使用手动安装方式"
-    local arch; arch=$(get_arch)
-    local tmp="/tmp/xray-install-$$"
-    mkdir -p "$tmp"
-    curl -fsSL -o "$tmp/xray.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip" || die "下载 xray 失败"
-    command -v unzip &>/dev/null || {
-        command -v apk &>/dev/null && apk add --no-cache unzip
-        command -v apt-get &>/dev/null && apt-get install -y -qq unzip
-    }
-    unzip -o "$tmp/xray.zip" xray -d /usr/local/bin/ || die "解压失败"
-    chmod +x "$XRAY_BINARY"
+    local pattern="linux-${arch}${libc_suffix}.tar.gz"
+    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    local info_tsv
+    info_tsv=$(curl -fsSL --retry 3 --connect-timeout 10 "$api_url" 2>/dev/null || true)
+    [[ -n "$info_tsv" ]] || die "无法读取 sing-box 发布信息"
+    local row
+    row=$(echo "$info_tsv" | jq -r --arg p "$pattern" '
+        [.assets[] | select(.name | endswith($p))] as $m
+        | [($m|length), ($m[0].name // ""), ($m[0].browser_download_url // ""), ($m[0].digest // "")]
+        | @tsv')
+    local count name url digest
+    IFS=$'\t' read -r count name url digest <<< "$row"
+    [[ "$count" == "1" ]] || die "sing-box 目标资产数量异常 (${count:-0})"
+    [[ "$url" == https://github.com/SagerNet/sing-box/releases/download/* ]] || die "sing-box 下载链接不可信"
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "sing-box 缺少 SHA-256 摘要"
+
+    local tmp; tmp=$(mktemp -d /var/tmp/.singbox-install.XXXXXX) || die "创建临时目录失败"
+    local archive="$tmp/sing-box.tar.gz"
+    wget -qO "$archive" "$url" || { rm -rf "$tmp"; die "sing-box 下载失败"; }
+    local expected actual
+    expected="${digest#sha256:}"
+    actual=$(sha256_of "$archive")
+    [[ -n "$actual" && "${actual,,}" == "$expected" ]] || { rm -rf "$tmp"; die "sing-box SHA-256 校验失败"; }
+    tar -xzf "$archive" -C "$tmp" || { rm -rf "$tmp"; die "sing-box 解压失败"; }
+    local bin; bin=$(find "$tmp" -name sing-box -type f 2>/dev/null | head -n1)
+    [[ -n "$bin" ]] || { rm -rf "$tmp"; die "未找到 sing-box 二进制"; }
+    chmod 755 "$bin" || { rm -rf "$tmp"; die "设置权限失败"; }
+    "$bin" version >/dev/null 2>&1 || { rm -rf "$tmp"; die "sing-box 无法执行"; }
+    mv -f "$bin" "$SINGBOX_BINARY" || { rm -rf "$tmp"; die "安装失败"; }
     rm -rf "$tmp"
-    ok "xray-core 安装完成"
+    ok "sing-box 安装完成: $("$SINGBOX_BINARY" version 2>/dev/null | head -n1)"
 }
 
-# ── 安装 cloudflared ──────────────────────────────────
+# ── 安装 cloudflared（稳健下载）────────────────────────
 install_cloudflared() {
-    echo "正在安装 cloudflared ..."
-    local arch; arch=$(get_arch)
-    curl -fsSL -o "$CLOUDFLARED_BINARY" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" || die "下载 cloudflared 失败"
-    chmod +x "$CLOUDFLARED_BINARY"
-    ok "cloudflared 安装完成"
+    info "正在安装 cloudflared ..."
+    local arch; arch=$(arch_tag)
+    [[ "$arch" == "armv7" ]] && arch="arm"
+    local asset="cloudflared-linux-${arch}"
+    local api_url="https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
+    local info_tsv
+    info_tsv=$(curl -fsSL --retry 3 --connect-timeout 10 "$api_url" 2>/dev/null || true)
+    [[ -n "$info_tsv" ]] || die "无法读取 cloudflared 发布信息"
+    local row
+    row=$(echo "$info_tsv" | jq -r --arg n "$asset" '
+        [.assets[] | select(.name == $n)] as $m
+        | [($m|length), ($m[0].browser_download_url // ""), ($m[0].digest // "")]
+        | @tsv')
+    local count url digest
+    IFS=$'\t' read -r count url digest <<< "$row"
+    [[ "$count" == "1" ]] || die "cloudflared 目标资产数量异常 (${count:-0})"
+    [[ "$url" == https://github.com/cloudflare/cloudflared/releases/download/* ]] || die "cloudflared 下载链接不可信"
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "cloudflared 缺少 SHA-256 摘要"
+
+    local tmp; tmp=$(mktemp /var/tmp/.cloudflared.XXXXXX) || die "创建临时文件失败"
+    wget -qO "$tmp" "$url" || { rm -f "$tmp"; die "cloudflared 下载失败"; }
+    local expected actual
+    expected="${digest#sha256:}"
+    actual=$(sha256_of "$tmp")
+    [[ -n "$actual" && "${actual,,}" == "$expected" ]] || { rm -f "$tmp"; die "cloudflared SHA-256 校验失败"; }
+    chmod 755 "$tmp" || { rm -f "$tmp"; die "设置权限失败"; }
+    "$tmp" --version >/dev/null 2>&1 || { rm -f "$tmp"; die "cloudflared 无法执行"; }
+    mv -f "$tmp" "$CLOUDFLARED_BINARY" || { rm -f "$tmp"; die "安装失败"; }
+    ok "cloudflared 安装完成: $("$CLOUDFLARED_BINARY" --version 2>/dev/null | head -n1)"
 }
 
 # ── CF API ────────────────────────────────────────────
@@ -201,17 +254,14 @@ cf_set_ingress() {
           '{config:{ingress:[{hostname:$h, service:("http://127.0.0.1:" + ($p|tostring))}, {service:"http_status:404"}]}}')" >/dev/null
 }
 
-# 确保域名的 CNAME 指向隧道（CF 一般会自动创建，这里兜底）
 cf_ensure_cname() {
     local zone_id="$1" domain="$2" tunnel_id="$3"
     local target="${tunnel_id}.cfargotunnel.com"
-    local existing
+    local existing rid
     existing=$(cf_call GET "/zones/$zone_id/dns_records?type=CNAME&name=$domain" | jq -r '.result[0].content // empty')
     if [[ "$existing" == "$target" ]]; then
         return 0
     fi
-    # 删除可能存在的旧记录
-    local rid
     rid=$(cf_call GET "/zones/$zone_id/dns_records?type=CNAME&name=$domain" | jq -r '.result[0].id // empty')
     if [[ -n "$rid" ]]; then
         cf_call DELETE "/zones/$zone_id/dns_records/$rid" >/dev/null 2>&1 || true
@@ -220,27 +270,25 @@ cf_ensure_cname() {
         "$(jq -n --arg n "$domain" --arg c "$target" '{type:"CNAME",name:$n,content:$c,proxied:false,ttl:1}')" >/dev/null
 }
 
-cf_get_tunnel_token() {
-    cf_call GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$1/token" | jq -r '.result'
-}
-
 cf_delete_tunnel() {
     cf_call DELETE "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$1" >/dev/null
 }
 
-# ── xray 服务 ─────────────────────────────────────────
-write_xray_systemd() {
-    [[ -f /etc/systemd/system/xray.service ]] && return
-    cat > /etc/systemd/system/xray.service << 'SVCEOF'
+# ── sing-box 服务 ──────────────────────────────────────
+write_singbox_systemd() {
+    [[ -f /etc/systemd/system/sing-box.service ]] && return
+    cat > /etc/systemd/system/sing-box.service << 'SVCEOF'
 [Unit]
-Description=Xray proxy server
-After=network.target
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json
 Restart=on-failure
-RestartSec=1
+RestartSec=3s
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -248,46 +296,45 @@ SVCEOF
     systemctl daemon-reload
 }
 
-write_xray_openrc() {
-    [[ -f /etc/init.d/xray ]] && return
-    cat > /etc/init.d/xray << 'SVCEOF'
+write_singbox_openrc() {
+    [[ -f /etc/init.d/sing-box ]] && return
+    cat > /etc/init.d/sing-box << 'SVCEOF'
 #!/sbin/openrc-run
-name="xray"
-description="Xray proxy server"
-command="/usr/local/bin/xray"
-command_args="run -config /usr/local/etc/xray/config.json"
+name="sing-box"
+description="sing-box service"
+command="/usr/local/bin/sing-box"
+command_args="run -c /usr/local/etc/sing-box/config.json"
 command_background=true
-pidfile="/run/xray.pid"
-output_log="/var/log/xray.log"
-error_log="/var/log/xray.log"
-respawn_delay=1
+pidfile="/run/sing-box.pid"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.log"
+respawn_delay=3
 respawn_max=0
-supervise_daemon_args="--respawn-delay 1 --respawn-max 0"
+supervise_daemon_args="--respawn-delay 3 --respawn-max 0"
 supervisor=supervise-daemon
 depend() { need net; after firewall; }
 SVCEOF
-    chmod +x /etc/init.d/xray
+    chmod +x /etc/init.d/sing-box
 }
 
-restart_xray() {
+restart_singbox() {
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        write_xray_systemd
-        systemctl restart xray
+        write_singbox_systemd
+        systemctl restart sing-box
     else
-        write_xray_openrc
-        rc-service xray restart
+        write_singbox_openrc
+        rc-service sing-box restart
     fi
 }
 
-is_active_xray() {
+is_active_singbox() {
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        systemctl is-active xray &>/dev/null
+        systemctl is-active sing-box &>/dev/null
     else
-        rc-service xray status &>/dev/null 2>&1
+        rc-service sing-box status &>/dev/null 2>&1
     fi
 }
 
-# ── cloudflared 服务 ──────────────────────────────────
 restart_cloudflared() {
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
         systemctl restart cloudflared
@@ -306,22 +353,19 @@ stop_cloudflared() {
     fi
 }
 
-# ── xray 配置 ─────────────────────────────────────────
-gen_xray_config() {
+# ── sing-box 配置 ──────────────────────────────────────
+gen_singbox_config() {
     local uid="$1" path="$2" port="$3"
     jq -n --arg uid "$uid" --arg path "$path" --argjson port "$port" '{
-        log:{loglevel:"warning"},
+        log:{level:"warn"},
         inbounds:[{
-            tag:"in-vless",
-            listen:"127.0.0.1",
-            port:$port,
-            protocol:"vless",
-            settings:{clients:[{id:$uid,flow:""}],decryption:"none"},
-            streamSettings:{network:"ws", security:"none", wsSettings:{path:$path}},
-            sniffing:{enabled:true, destOverride:["http","tls"]}
+            type:"vless", tag:"in-vless",
+            listen:"127.0.0.1", listen_port:$port,
+            users:[{name:"", uuid:$uid, flow:""}],
+            transport:{type:"ws", path:$path}
         }],
-        outbounds:[{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}],
-        routing:{domainStrategy:"AsIs",rules:[{type:"field",outboundTag:"block",protocol:["bittorrent"]}]}
+        outbounds:[{type:"direct",tag:"direct"},{type:"block",tag:"block"}],
+        route:{rules:[{protocol:"bittorrent", outbound:"block"}]}
     }'
 }
 
@@ -341,17 +385,14 @@ save_links_snapshot() {
     chmod 600 "$LAST_LINKS_PATH"
 }
 
-print_link() {
-    local link="$1"
-    echo "  VLESS节点 $link"
-}
+print_link() { echo "  VLESS节点 $1"; }
 
 # ── 1. 安装 ──────────────────────────────────────────
 do_install() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] && die "检测到上次配置($(echo "$state" | jq -r '.domain // "?"'))，请先卸载"
 
-    [[ -f "$XRAY_BINARY" ]] && ok "xray-core 已安装" || install_xray
+    [[ -f "$SINGBOX_BINARY" ]] && ok "sing-box 已安装" || install_singbox
 
     prompt_cf
 
@@ -374,10 +415,11 @@ do_install() {
 
     echo
     echo "配置预览:"
+    echo "  内核:  sing-box"
     echo "  域名:  $domain"
     echo "  UUID:  $uid"
     echo "  隧道:  $TUNNEL_NAME"
-    echo "  端口:  $port (xray 本地监听)"
+    echo "  端口:  $port (sing-box 本地监听)"
     echo "  路径:  $path"
     echo
     read -rp "确认部署? (Y/n): " confirm
@@ -398,13 +440,13 @@ do_install() {
     cf_ensure_cname "$zone_id" "$domain" "$tunnel_id"
     ok "入口已配置: $domain -> http://127.0.0.1:$port"
 
-    # 3) xray
-    info "配置 xray ..."
-    mkdir -p "$XRAY_CONFIG_DIR"
-    gen_xray_config "$uid" "$path" "$port" > "$XRAY_CONFIG_PATH"
-    chmod 644 "$XRAY_CONFIG_PATH"
-    restart_xray
-    ok "xray 已启动"
+    # 3) sing-box
+    info "配置 sing-box ..."
+    mkdir -p "$SINGBOX_DIR"
+    gen_singbox_config "$uid" "$path" "$port" > "$SINGBOX_CONFIG"
+    chmod 644 "$SINGBOX_CONFIG"
+    restart_singbox
+    ok "sing-box 已启动"
 
     # 4) cloudflared 服务
     info "安装 cloudflared 服务 ..."
@@ -437,32 +479,31 @@ do_uninstall() {
     tunnel_id=$(echo "$state" | jq -r '.tunnel_id // ""')
     echo "正在卸载: $domain"
 
-    # cloudflared
     if command -v cloudflared &>/dev/null; then
         cloudflared service uninstall &>/dev/null 2>&1 || true
         stop_cloudflared
         ok "cloudflared 已停止并卸载服务"
     fi
 
-    # xray
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        systemctl stop xray &>/dev/null 2>&1 || true
-        systemctl disable xray &>/dev/null 2>&1 || true
+        systemctl stop sing-box &>/dev/null 2>&1 || true
+        systemctl disable sing-box &>/dev/null 2>&1 || true
     else
-        rc-service xray stop &>/dev/null 2>&1 || true
-        rc-update del xray default &>/dev/null 2>&1 || true
+        rc-service sing-box stop &>/dev/null 2>&1 || true
+        rc-update del sing-box default &>/dev/null 2>&1 || true
     fi
-    rm -f "$XRAY_CONFIG_PATH"
-    ok "xray 已停止"
+    rm -f "$SINGBOX_CONFIG"
+    ok "sing-box 已停止"
 
-    # 删除隧道 + DNS
     if load_cf_account && [[ -n "$tunnel_id" ]]; then
         cf_delete_tunnel "$tunnel_id" && ok "隧道已删除: $tunnel_id"
         local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id // ""')
         if [[ -n "$zone_id" ]]; then
             local rid
             rid=$(cf_call GET "/zones/$zone_id/dns_records?type=CNAME&name=$domain" | jq -r '.result[0].id // empty')
-            [[ -n "$rid" ]] && cf_call DELETE "/zones/$zone_id/dns_records/$rid" >/dev/null && ok "DNS CNAME 已删除"
+            if [[ -n "$rid" ]]; then
+                cf_call DELETE "/zones/$zone_id/dns_records/$rid" >/dev/null && ok "DNS CNAME 已删除"
+            fi
         fi
     else
         echo "无 CF 凭据，跳过隧道删除"
@@ -487,12 +528,13 @@ do_modify() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
 
-    local domain uid port path tunnel_id
+    local domain uid port path tunnel_id zone_id
     domain=$(echo "$state" | jq -r '.domain')
     uid=$(echo "$state" | jq -r '.uuid')
     port=$(echo "$state" | jq -r '.port')
     path=$(echo "$state" | jq -r '.path')
     tunnel_id=$(echo "$state" | jq -r '.tunnel_id')
+    zone_id=$(echo "$state" | jq -r '.zone_id')
 
     echo
     echo "当前配置:"
@@ -523,7 +565,7 @@ do_modify() {
     fi
     if [[ "$mc" == "2" ]]; then
         read -rp "新端口(当前=$port): " np
-        [[ -n "$np" ]] && [[ "$np" =~ ^[0-9]+$ ]] || die "无效端口"
+        [[ -n "$np" && "$np" =~ ^[0-9]+$ ]] || die "无效端口"
         port="$np"
         changed=true
     fi
@@ -536,12 +578,10 @@ do_modify() {
     fi
     [[ "$changed" == "true" ]] || { echo "无修改"; return; }
 
-    # xray
-    gen_xray_config "$uid" "$path" "$port" > "$XRAY_CONFIG_PATH"
-    restart_xray
-    ok "xray 已重启"
+    gen_singbox_config "$uid" "$path" "$port" > "$SINGBOX_CONFIG"
+    restart_singbox
+    ok "sing-box 已重启"
 
-    # 隧道入口（端口可能变了）
     if load_cf_account; then
         cf_set_ingress "$tunnel_id" "$domain" "$port"
         ok "隧道入口已更新"
@@ -549,7 +589,7 @@ do_modify() {
 
     local link; link=$(build_link "$uid" "$domain" "$path")
     save_links_snapshot "$domain" "$uid" "$link"
-    save_state "$(jq -n --arg d "$domain" --arg z "$(echo "$state" | jq -r '.zone_id')" --arg u "$uid" --arg tid "$tunnel_id" --argjson p "$port" --arg pa "$path" --arg l "$link" \
+    save_state "$(jq -n --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg tid "$tunnel_id" --argjson p "$port" --arg pa "$path" --arg l "$link" \
         '{domain:$d,zone_id:$z,uuid:$u,tunnel_id:$tid,port:$p,path:$pa,link:$l}')"
 
     echo
@@ -559,13 +599,13 @@ do_modify() {
 
 # ── 5. 重启 ──────────────────────────────────────────
 do_restart() {
-    restart_xray
-    ok "xray 已重启"
+    restart_singbox
+    ok "sing-box 已重启"
     restart_cloudflared
     ok "cloudflared 已重启"
 }
 
-# ── 6. 隧道状态 ──────────────────────────────────────
+# ── 6. 状态 ──────────────────────────────────────────
 do_status() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
@@ -574,7 +614,7 @@ do_status() {
     echo "UUID: $(echo "$state" | jq -r '.uuid')"
     echo "隧道: $(echo "$state" | jq -r '.tunnel_id')"
     echo
-    echo -n "xray:       "; is_active_xray && echo "运行中" || echo "未运行"
+    echo -n "sing-box:    "; is_active_singbox && echo "运行中" || echo "未运行"
     echo -n "cloudflared: "; if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl is-active cloudflared &>/dev/null && echo "运行中" || echo "未运行"; else rc-service cloudflared status &>/dev/null 2>&1 && echo "运行中" || echo "未运行"; fi
     echo
     print_link "$(echo "$state" | jq -r '.link')"
@@ -598,8 +638,8 @@ main() {
     [[ "$(id -u)" == "0" ]] || die "请使用 root 运行此脚本"
     detect_init
     install_deps
-    need_cmd() { command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
-    need_cmd curl; need_cmd jq
+    command -v curl &>/dev/null || die "缺少依赖: curl"
+    command -v jq   &>/dev/null || die "缺少依赖: jq"
     ensure_shortcut
 
     local state current_domain=""
@@ -607,7 +647,7 @@ main() {
     [[ -n "$state" ]] && current_domain=$(echo "$state" | jq -r '.domain // ""')
 
     echo
-    echo "  xray-cf-tunnel ($INIT_SYSTEM)"
+    echo "  xray-cf-tunnel (sing-box + Argo) ($INIT_SYSTEM)"
     echo
     echo "  1. 安装节点"
     echo "  2. 卸载"
