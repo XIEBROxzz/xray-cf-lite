@@ -405,10 +405,18 @@ start_cloudflared() {
 stop_cloudflared() {
     local pid=""
     [[ -f "$CLOUDFLARED_PID" ]] && pid=$(cat "$CLOUDFLARED_PID" 2>/dev/null)
-    # 清理所有 cloudflared 进程（含可能残留的无 PID 进程）
-    if pgrep -f "$CLOUDFLARED_BINARY" &>/dev/null 2>&1; then
-        pkill -f "$CLOUDFLARED_BINARY" 2>/dev/null || true
+    # 优先按 PID 文件杀，再兜底清理可能残留的 cloudflared 进程
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
         sleep 1
+    fi
+    # 兜底：清理所有 cloudflared 进程（兼容无 pgrep/pkill 的精简环境）
+    local leftover
+    leftover=$(ps -eo pid,comm 2>/dev/null | awk -v b="$CLOUDFLARED_BINARY" '$0 ~ b {print $1}')
+    if [[ -n "$leftover" ]]; then
+        for p in $leftover; do
+            kill "$p" 2>/dev/null || true
+        done
     fi
     rm -f "$CLOUDFLARED_PID"
     disable_cloudflared_watchdog
@@ -436,8 +444,42 @@ cloudflared_keepalive() {
     chmod 600 "$CLOUDFLARED_PID" 2>/dev/null || true
 }
 
+# 确保 cron 守护进程运行（Alpine 默认可能未装/未启动 crond）
+ensure_cron_running() {
+    # Alpine: busybox crond 或 cronie
+    if [[ -f /etc/alpine-release ]]; then
+        if ! command -v crond &>/dev/null; then
+            command -v apk &>/dev/null && apk add --no-cache cronie >/dev/null 2>&1 || return 1
+        fi
+        if command -v rc-service &>/dev/null && rc-service crond status &>/dev/null 2>&1; then
+            return 0
+        elif ! pgrep_crond; then
+            crond -l notice 2>/dev/null || crond -L /dev/null 2>/dev/null || crond 2>/dev/null || true
+        fi
+        return 0
+    fi
+    # Debian/Ubuntu systemd
+    if command -v systemctl &>/dev/null; then
+        ( systemctl -q is-active cron || systemctl -q is-active crond ) 2>/dev/null \
+            && return 0
+        systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true
+        return 0
+    fi
+    # 其它 init
+    if command -v rc-service &>/dev/null; then
+        ( rc-service cron status 2>/dev/null || rc-service crond status 2>/dev/null ) && return 0
+        rc-service crond start 2>/dev/null || rc-service cron start 2>/dev/null || true
+    fi
+    return 0
+}
+
+pgrep_crond() {
+    ps -eo comm 2>/dev/null | grep -qiE '^(crond|fcron|cron)$'
+}
+
 enable_cloudflared_watchdog() {
     command -v crontab &>/dev/null || return 1
+    ensure_cron_running || return 1
     # 写入独立 keepalive 脚本（不依赖主脚本文件路径，兼容 bash <(curl) 执行方式）
     local ks="/usr/local/bin/singbox-cf-keepalive"
     cat > "$ks" <<'KEOF'
