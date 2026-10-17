@@ -18,12 +18,32 @@
 
 ## 安装
 
+两个版本，按需选择：
+
+### 版本 A：DNS + Origin Rules（需公网 IP）
+
 ```bash
 apk add bash curl jq
 bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_lite.sh)
 ```
 
-首次运行后自动注册快捷命令 `x`，之后直接输入 `x` 即可（每次联网拉取最新脚本执行）。
+快捷命令：`x`
+
+### 版本 B：Cloudflare Tunnel（无需公网 IP / 端口映射）
+
+```bash
+apk add bash curl jq
+bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_tunnel.sh)
+```
+
+快捷命令：`xt`
+
+| | 版本 A | 版本 B |
+|---|---|---|
+| 接入方式 | DNS + Origin Rules | cloudflared 隧道 |
+| 公网 IP | 需要 | 不需要 |
+| 端口映射（NAT） | 需要 | 不需要 |
+| 快捷命令 | `x` | `xt` |
 
 ## 功能
 
@@ -72,22 +92,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 - 卸载会完整回滚 CF 配置（DNS / SSL / Origin Rules），并清理本地状态、凭据、证书
 - CF 凭据只存在服务器本地，不会上传
 - 一台服务器同时只支持一组部署（再次安装需先卸载）
-
----
-
-## Cloudflare Tunnel 版（Argo）
-
-另有一个独立脚本 `xray_cf_tunnel.sh`，用 cloudflared 隧道，**无需公网 IP / 端口映射**：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_tunnel.sh)
-```
-
-- 自动创建 CF Tunnel + 配置入口 + 安装 cloudflared 系统服务
-- 输出单个 VLESS 节点（走 CF 边缘）
-- 快捷命令 `xt`
-- 需要 CF 账号邮箱 + Global API Key（含 Tunnel 权限）
-- 与主脚本的区别：主脚本用 DNS + Origin Rules，本脚本用 Tunnel（更适合无公网 IP 的小鸡）
 
 ---
 
