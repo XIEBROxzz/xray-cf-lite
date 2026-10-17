@@ -1105,7 +1105,7 @@ ensure_shortcut() {
     [[ -f "$target" ]] && return
     cat > "$target" << 'SCEOF'
 #!/bin/sh
-exec bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/xray-cf-lite/main/xray_cf_lite.sh) "$@"
+exec bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_lite.sh) "$@"
 SCEOF
     chmod +x "$target"
 }
