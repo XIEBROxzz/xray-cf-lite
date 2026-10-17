@@ -451,6 +451,10 @@ ensure_cron_running() {
         if ! command -v crond &>/dev/null; then
             command -v apk &>/dev/null && apk add --no-cache cronie >/dev/null 2>&1 || return 1
         fi
+        # 让 crond 开机自启（否则重启后 watchdog 不生效）
+        if command -v rc-update &>/dev/null; then
+            rc-update add crond default 2>/dev/null || rc-update add cronie default 2>/dev/null || true
+        fi
         if command -v rc-service &>/dev/null && rc-service crond status &>/dev/null 2>&1; then
             return 0
         elif ! pgrep_crond; then
@@ -506,10 +510,12 @@ chmod 600 "$PID_FILE" 2>/dev/null
 KEOF
     chmod 700 "$ks"
 
-    local job="* * * * * $ks >/dev/null 2>&1"
+    # 两条 cron 任务：@reboot 开机立即启动 + 每分钟 keepalive 兜底
+    local job_reboot="@reboot $ks >/dev/null 2>&1"
+    local job_min="* * * * * $ks >/dev/null 2>&1"
     crontab -l 2>/dev/null | grep -Fq "singbox-cf-keepalive" && return 0
-    (crontab -l 2>/dev/null; echo "$job") | crontab - 2>/dev/null && \
-        info "已启用 cloudflared 看门狗 (cron 每分钟 keepalive)"
+    (crontab -l 2>/dev/null; echo "$job_reboot"; echo "$job_min") | crontab - 2>/dev/null && \
+        info "已启用 cloudflared 看门狗 (@reboot 自启 + 每分钟 keepalive)"
 }
 
 disable_cloudflared_watchdog() {
