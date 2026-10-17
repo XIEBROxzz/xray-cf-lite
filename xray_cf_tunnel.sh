@@ -13,6 +13,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_CONFIG="$SINGBOX_DIR/config.json"
 SINGBOX_BINARY="/usr/local/bin/sing-box"
 CLOUDFLARED_BINARY="/usr/local/bin/cloudflared"
+CLOUDFLARED_CONFIG="/etc/cloudflared/config.yml"
 STATE_DIR="/etc/sing-box-cf-tunnel"
 STATE_PATH="$STATE_DIR/state.json"
 CF_ACCOUNT_PATH="$STATE_DIR/cf_account.json"
@@ -256,11 +257,30 @@ cf_create_tunnel() {
         | jq -r '.result | "\(.id) \(.token)"'
 }
 
-cf_set_ingress() {
-    local tunnel_id="$1" domain="$2" port="$3"
-    cf_call PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$tunnel_id/configurations" \
-        "$(jq -n --arg h "$domain" --argjson p "$port" \
-          '{config:{ingress:[{hostname:$h, service:("http://127.0.0.1:" + ($p|tostring))}, {service:"http_status:404"}]}}')" >/dev/null
+# ── 本地 cloudflared config.yml（token + 完整 ingress）──
+# 关键：token 方式的隧道是「本地托管」，ingress 必须写在本地 config，
+# 否则 cloudflared 只建立连接、没有路由规则，隧道不生效。
+write_cloudflared_config() {
+    local token="$1" domain="$2" port="$3"
+    mkdir -p "$(dirname "$CLOUDFLARED_CONFIG")"
+    if [[ -z "$token" ]]; then
+        # 复用已有 token（保留原 config 中的 tunnel 行），仅更新 ingress
+        local old_token=""
+        if [[ -f "$CLOUDFLARED_CONFIG" ]]; then
+            old_token=$(grep -E '^tunnel:' "$CLOUDFLARED_CONFIG" 2>/dev/null | awk '{print $2}' | head -n1)
+        fi
+        token="$old_token"
+    fi
+    [[ -n "$token" ]] || die "缺少 cloudflared tunnel token"
+
+    cat > "$CLOUDFLARED_CONFIG" <<EOF
+tunnel: $token
+ingress:
+  - hostname: $domain
+    service: http://127.0.0.1:$port
+  - service: http_status:404
+EOF
+    chmod 600 "$CLOUDFLARED_CONFIG"
 }
 
 cf_ensure_cname() {
@@ -459,9 +479,9 @@ do_install() {
     [[ -n "$tunnel_id" && -n "$token" ]] || die "创建隧道失败"
     ok "隧道已创建: $tunnel_id ($tunnel_name)"
 
-    # 2) 配置入口 + CNAME
+    # 2) 配置入口（本地 config.yml）+ CNAME
     info "配置隧道入口 ..."
-    cf_set_ingress "$tunnel_id" "$domain" "$port"
+    write_cloudflared_config "$token" "$domain" "$port"
     cf_ensure_cname "$zone_id" "$domain" "$tunnel_id"
     ok "入口已配置: $domain -> http://127.0.0.1:$port"
 
@@ -473,10 +493,12 @@ do_install() {
     restart_singbox
     ok "sing-box 已启动"
 
-    # 4) cloudflared 服务
+    # 4) cloudflared 服务（使用本地 config.yml，含 token + ingress）
     info "安装 cloudflared 服务 ..."
     install_cloudflared
-    "$CLOUDFLARED_BINARY" service install "$token"
+    "$CLOUDFLARED_BINARY" service install --config "$CLOUDFLARED_CONFIG" 2>/dev/null \
+        || "$CLOUDFLARED_BINARY" service install 2>/dev/null \
+        || die "cloudflared 服务安装失败"
     restart_cloudflared
     ok "cloudflared 已启动"
 
@@ -539,7 +561,7 @@ do_uninstall() {
         echo "无 CF 凭据，跳过隧道删除"
     fi
 
-    rm -f "$STATE_PATH" "$CF_ACCOUNT_PATH" "$LAST_LINKS_PATH"
+    rm -f "$STATE_PATH" "$CF_ACCOUNT_PATH" "$LAST_LINKS_PATH" "$CLOUDFLARED_CONFIG"
     ok "卸载完成"
 }
 
@@ -613,7 +635,8 @@ do_modify() {
     ok "sing-box 已重启"
 
     if load_cf_account; then
-        cf_set_ingress "$tunnel_id" "$domain" "$port"
+        write_cloudflared_config "" "$domain" "$port"
+        restart_cloudflared
         ok "隧道入口已更新"
     fi
 
