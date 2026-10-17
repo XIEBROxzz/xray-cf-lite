@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-#  xray_cf_tunnel.sh — 一键 Cloudflare Tunnel (Argo) 节点部署
+#  sing-box_cf_tunnel.sh — 一键 Cloudflare Tunnel (Argo) 节点部署
 #  内核: sing-box   协议: VLESS + WebSocket
 #  无需公网 IP / 端口映射，cloudflared 隧道主动连 CF
 #  内核下载参考 singbox-lite：GitHub API + wget + SHA256 校验
@@ -13,11 +13,11 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_CONFIG="$SINGBOX_DIR/config.json"
 SINGBOX_BINARY="/usr/local/bin/sing-box"
 CLOUDFLARED_BINARY="/usr/local/bin/cloudflared"
-STATE_DIR="/etc/xray-cf-tunnel"
+STATE_DIR="/etc/sing-box-cf-tunnel"
 STATE_PATH="$STATE_DIR/state.json"
 CF_ACCOUNT_PATH="$STATE_DIR/cf_account.json"
 LAST_LINKS_PATH="$(pwd)/cf_tunnel_last_links.txt"
-TUNNEL_NAME="xray-cf-tunnel"
+SINGBOX_LISTEN_PORT="8080"
 
 CF_API="https://api.cloudflare.com/client/v4"
 
@@ -239,11 +239,20 @@ cf_find_zone() {
     echo "$best_id $acct"
 }
 
+# ── 隧道名称生成：取二级域名前缀 ───────────────────────
+# abc.example.com -> abc ; example.com -> example ; a.b.c.example.com -> a
+tunnel_name_from_domain() {
+    local domain="$1"
+    domain="${domain%%.}"
+    printf '%s' "$domain" | awk -F. '{print $1}' | tr -cd 'a-zA-Z0-9-_'
+}
+
 # ── Tunnel ────────────────────────────────────────────
 cf_create_tunnel() {
+    local tname="$1"
     [[ -n "$CF_ACCOUNT_ID" ]] || die "CF Account ID 为空，无法创建隧道"
     cf_call POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" \
-        "$(jq -n --arg n "$TUNNEL_NAME" '{name:$n, config_src:"cloudflare"}')" \
+        "$(jq -n --arg n "$tname" '{name:$n, config_src:"cloudflare"}')" \
         | jq -r '.result | "\(.id) \(.token)"'
 }
 
@@ -257,17 +266,29 @@ cf_set_ingress() {
 cf_ensure_cname() {
     local zone_id="$1" domain="$2" tunnel_id="$3"
     local target="${tunnel_id}.cfargotunnel.com"
-    local existing rid
-    existing=$(cf_call GET "/zones/$zone_id/dns_records?type=CNAME&name=$domain" | jq -r '.result[0].content // empty')
-    if [[ "$existing" == "$target" ]]; then
+    local rec existing_content existing_id
+
+    # 查询现有 CNAME 记录
+    rec=$(cf_call GET "/zones/$zone_id/dns_records?type=CNAME&name=${domain}" 2>/dev/null || true)
+    existing_content=$(echo "$rec" | jq -r '.result[0].content // empty')
+    existing_id=$(echo "$rec" | jq -r '.result[0].id // empty')
+
+    # 已存在且指向正确的隧道，直接返回
+    if [[ "$existing_content" == "$target" && -n "$existing_id" ]]; then
+        info "DNS CNAME 已存在: $domain -> $target"
         return 0
     fi
-    rid=$(cf_call GET "/zones/$zone_id/dns_records?type=CNAME&name=$domain" | jq -r '.result[0].id // empty')
-    if [[ -n "$rid" ]]; then
-        cf_call DELETE "/zones/$zone_id/dns_records/$rid" >/dev/null 2>&1 || true
+
+    # 若存在错误记录，先删除
+    if [[ -n "$existing_id" ]]; then
+        info "删除旧的 CNAME 记录: $existing_id ($existing_content)"
+        cf_call DELETE "/zones/$zone_id/dns_records/$existing_id" >/dev/null || true
     fi
+
+    # 创建 CNAME，proxied=true（橙色云）确保走 Argo 隧道
     cf_call POST "/zones/$zone_id/dns_records" \
-        "$(jq -n --arg n "$domain" --arg c "$target" '{type:"CNAME",name:$n,content:$c,proxied:false,ttl:1}')" >/dev/null
+        "$(jq -n --arg n "$domain" --arg c "$target" '{type:"CNAME",name:$n,content:$c,proxied:true,ttl:1}')" >/dev/null
+    ok "DNS CNAME 已创建: $domain -> $target (proxied)"
 }
 
 cf_delete_tunnel() {
@@ -413,28 +434,30 @@ do_install() {
     local uid; uid=$(gen_uuid)
     local short_id="${uid:0:8}"
     local path="/${short_id}-vl"
-    local port; port=$(( RANDOM % 50000 + 10000 ))
+    local port="${SINGBOX_LISTEN_PORT}"
+    local tunnel_name; tunnel_name=$(tunnel_name_from_domain "$domain")
+    [[ -n "$tunnel_name" ]] || die "无法从域名提取隧道名: $domain"
 
     echo
     echo "配置预览:"
-    echo "  内核:  sing-box"
-    echo "  域名:  $domain"
-    echo "  UUID:  $uid"
-    echo "  隧道:  $TUNNEL_NAME"
-    echo "  端口:  $port (sing-box 本地监听)"
-    echo "  路径:  $path"
+    echo "  内核:   sing-box"
+    echo "  域名:   $domain"
+    echo "  UUID:   $uid"
+    echo "  隧道名: $tunnel_name"
+    echo "  端口:   $port (sing-box 本地监听)"
+    echo "  路径:   $path"
     echo
     read -rp "确认部署? (Y/n): " confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
 
     # 1) 创建隧道
-    info "创建 Cloudflare Tunnel ..."
+    info "创建 Cloudflare Tunnel ($tunnel_name) ..."
     local tr tunnel_id token
-    tr=$(cf_create_tunnel)
+    tr=$(cf_create_tunnel "$tunnel_name")
     tunnel_id=$(echo "$tr" | awk '{print $1}')
     token=$(echo "$tr" | awk '{print $2}')
     [[ -n "$tunnel_id" && -n "$token" ]] || die "创建隧道失败"
-    ok "隧道已创建: $tunnel_id"
+    ok "隧道已创建: $tunnel_id ($tunnel_name)"
 
     # 2) 配置入口 + CNAME
     info "配置隧道入口 ..."
@@ -501,10 +524,15 @@ do_uninstall() {
         cf_delete_tunnel "$tunnel_id" && ok "隧道已删除: $tunnel_id"
         local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id // ""')
         if [[ -n "$zone_id" ]]; then
-            local rid
-            rid=$(cf_call GET "/zones/$zone_id/dns_records?type=CNAME&name=$domain" | jq -r '.result[0].id // empty')
-            if [[ -n "$rid" ]]; then
-                cf_call DELETE "/zones/$zone_id/dns_records/$rid" >/dev/null && ok "DNS CNAME 已删除"
+            # 删除绑定域名对应的 DNS 记录（不限类型，CNAME/A 同名都清理）
+            local rids
+            rids=$(cf_call GET "/zones/$zone_id/dns_records?name=$domain" | jq -r '.result[]?.id' 2>/dev/null)
+            if [[ -n "$rids" ]]; then
+                while IFS= read -r rid; do
+                    [[ -n "$rid" ]] && cf_call DELETE "/zones/$zone_id/dns_records/$rid" >/dev/null && ok "DNS 记录已删除: $domain"
+                done <<< "$rids"
+            else
+                info "未找到 $domain 的 DNS 记录"
             fi
         fi
     else
@@ -649,7 +677,7 @@ main() {
     [[ -n "$state" ]] && current_domain=$(echo "$state" | jq -r '.domain // ""')
 
     echo
-    echo "  xray-cf-tunnel (sing-box + Argo) ($INIT_SYSTEM)"
+    echo "  sing-box + Argo (Cloudflare Tunnel) 节点管理"
     echo
     echo "  1. 安装节点"
     echo "  2. 卸载"
