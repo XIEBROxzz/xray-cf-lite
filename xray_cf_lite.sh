@@ -63,13 +63,6 @@ install_deps() {
     command -v jq      &>/dev/null || missing+=(jq)
     command -v unzip   &>/dev/null || missing+=(unzip)
     command -v openssl &>/dev/null || missing+=(openssl)
-    command -v ip      &>/dev/null || missing+=(iproute2)
-    command -v ss      &>/dev/null || missing+=(iproute2)
-    command -v uuidgen &>/dev/null || missing+=(util-linux)
-
-    # 去重
-    missing=($(printf '%s\n' "${missing[@]}" | awk '!seen[$0]++'))
-
     [[ ${#missing[@]} -eq 0 ]] && return
 
     echo "安装依赖: ${missing[*]}"
