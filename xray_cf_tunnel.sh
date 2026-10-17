@@ -236,12 +236,12 @@ cf_find_zone() {
         fi
     done <<< "$zones"
     [[ -n "$best_id" ]] || return 1
-    CF_ACCOUNT_ID="$acct"
-    echo "$best_id"
+    echo "$best_id $acct"
 }
 
 # ── Tunnel ────────────────────────────────────────────
 cf_create_tunnel() {
+    [[ -n "$CF_ACCOUNT_ID" ]] || die "CF Account ID 为空，无法创建隧道"
     cf_call POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" \
         "$(jq -n --arg n "$TUNNEL_NAME" '{name:$n, config_src:"cloudflare"}')" \
         | jq -r '.result | "\(.id) \(.token)"'
@@ -396,11 +396,13 @@ do_install() {
 
     prompt_cf
 
-    local domain zone_id
+    local domain zone_id zinfo
     while true; do
         read -rp "绑定域名: " domain || die "输入已中断"
         [[ -z "$domain" ]] && { echo "域名不能为空，请重试"; continue; }
-        if zone_id=$(cf_find_zone "$domain"); then
+        if zinfo=$(cf_find_zone "$domain"); then
+            zone_id=$(echo "$zinfo" | awk '{print $1}')
+            CF_ACCOUNT_ID=$(echo "$zinfo" | awk '{print $2}')
             info "匹配到 Zone: $zone_id"
             break
         fi
