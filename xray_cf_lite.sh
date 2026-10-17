@@ -13,11 +13,9 @@ LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="xray-cf-lite "
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-SUB_BASE="https://yx-auto.pages.dev"
 
-declare -A PROTO_SUFFIX=([vless]="vl" [trojan]="tr" [vmess]="vm")
-declare -A PROTO_LABEL=([vless]="VLESS" [trojan]="TROJAN" [vmess]="VMESS")
-declare -A PROTO_FLAG=([vless]="ev" [trojan]="et" [vmess]="mess")
+declare -A PROTO_SUFFIX=([vless]="vl")
+declare -A PROTO_LABEL=([vless]="VLESS")
 
 # ── 工具 ──────────────────────────────────────────────
 die()     { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -554,12 +552,11 @@ write_xray_config() {
     ok "xray 配置已写入 $XRAY_CONFIG_PATH"
 }
 
-# ── 订阅链接 ─────────────────────────────────────────
+# ── 节点链接 ─────────────────────────────────────────
 build_link() {
-    local uid="$1" domain="$2" proto="$3" path="$4"
-    local ev="no" et="no" evm="no"
-    case "$proto" in vless) ev="yes";; trojan) et="yes";; vmess) evm="yes";; esac
-    echo "${SUB_BASE}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
+    # 单个 VLESS 节点：直连域名（走 CF 橙云 + Origin Rules）
+    local uid="$1" domain="$2" path="$4"
+    echo "vless://${uid}@${domain}:443?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=$(urlencode "$path")#VLESS"
 }
 
 gen_all_links() {
@@ -590,28 +587,11 @@ print_links() {
     local links_json="$1"
     local proto link
     while IFS=$'\t' read -r proto link; do
-        echo "  ${PROTO_LABEL[$proto]:-$proto}订阅 $link"
+        echo "  ${PROTO_LABEL[$proto]:-$proto}节点 $link"
     done < <(echo "$links_json" | jq -r 'to_entries[] | [.key, .value] | @tsv')
 }
 
 # ── 交互辅助 ─────────────────────────────────────────
-prompt_protocols() {
-    read -rp "创建协议(1=vless,2=trojan,3=vmess，逗号分隔，留空=全部): " proto_raw
-    local protocols=()
-    if [[ -z "$proto_raw" ]]; then
-        protocols=(vless trojan vmess)
-    else
-        local -A pmap=([1]=vless [2]=trojan [3]=vmess [vless]=vless [trojan]=trojan [vmess]=vmess)
-        IFS=',' read -ra tokens <<< "$proto_raw"
-        for t in "${tokens[@]}"; do
-            t="${t,,}"; t="${t// /}"
-            [[ -n "${pmap[$t]:-}" ]] || die "未知协议: $t"
-            protocols+=("${pmap[$t]}")
-        done
-    fi
-    echo "${protocols[@]}"
-}
-
 prompt_uuid() {
     local uid
     read -rp "UUID(留空=自动生成): " custom_uuid
@@ -718,9 +698,7 @@ do_install() {
         echo "无法在该 CF 账号下匹配 Zone: $domain，请确认域名已托管并重输（Ctrl+C 退出）"
     done
 
-    local protocols_str
-    protocols_str=$(prompt_protocols)
-    read -ra protocols <<< "$protocols_str"
+    local protocols=(vless)
 
     local uid
     uid=$(prompt_uuid)
@@ -768,7 +746,7 @@ do_install() {
     local security_backup
     security_backup=$(cf_relax_security "$zone_id")
 
-    # 订阅
+    # 节点链接
     local links_json
     links_json=$(gen_all_links "$uid" "$domain" "$routes_json")
     save_links_snapshot "$domain" "$uid" "$links_json"
@@ -797,7 +775,7 @@ do_install() {
     ok "部署完成"
     print_links "$links_json"
     echo
-    echo "订阅已保存到 $LAST_LINKS_PATH"
+    echo "节点链接已保存到 $LAST_LINKS_PATH"
 }
 
 # ── 2. 卸载 ──────────────────────────────────────────
@@ -842,15 +820,15 @@ do_uninstall() {
 
     remove_state
     rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH"
-    ok "已清理订阅快照与 CF 凭据"
+    ok "已清理节点快照与 CF 凭据"
     ok "卸载完成"
 }
 
-# ── 3. 查看订阅 ──────────────────────────────────────
+# ── 3. 查看节点 ──────────────────────────────────────
 do_show() {
     if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
     local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "无历史订阅"
+    [[ -n "$state" ]] || die "无历史节点"
     echo "域名: $(echo "$state" | jq -r '.domain')"
     echo "UUID: $(echo "$state" | jq -r '.uuid')"
     echo "$state" | jq -r '.links | to_entries[] | "\(.key) \(.value)"'
@@ -973,7 +951,7 @@ do_show_config() {
     echo
     echo -n "xray: "; svc_is_active && echo "运行中" || echo "未运行"
     echo
-    echo "订阅:"
+    echo "节点:"
     print_links "$(echo "$state" | jq '.links')"
     echo
 }
@@ -1151,7 +1129,7 @@ main() {
     echo
     echo "  1. 安装节点"
     echo "  2. 卸载"
-    echo "  3. 查看订阅"
+    echo "  3. 查看节点"
     echo "  4. 修改配置(UUID/端口/路径)"
     echo "  5. 查看当前配置"
     echo "  6. 更新外部端口(NAT换端口)"
