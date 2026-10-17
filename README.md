@@ -38,8 +38,8 @@
 如果服务器是 NAT（内网 IP，通过端口映射暴露服务），需要提前知道：
 
 - SSH 端口映射（用于登录）
-- 可用的端口映射（用于节点，至少 1 组，每个协议需要 1 组）
-- 安装时按提示逐个输入每个协议的内部端口和外部端口
+- 可用的端口映射（用于节点，至少 1 组）
+- 安装时输入节点的内部端口和外部端口
 
 ## 安装
 
@@ -61,11 +61,11 @@ x
 ## 功能
 
 ```
-1. 安装节点        部署 xray + 配置 CF（DNS/SSL/Origin Rules）+ 生成订阅链接
-2. 卸载            停止 xray + 回滚 CF 配置(DNS/SSL/Origin Rules) + 清理本地状态/凭据/订阅快照
-3. 查看订阅        显示上次生成的订阅链接
-4. 修改配置        修改 UUID / 端口 / WS 路径（可单改或全改）
-5. 查看当前配置    显示域名、UUID、端口映射、xray 服务状态、订阅链接
+1. 安装节点        部署 xray + 配置 CF（DNS/SSL/Origin Rules）+ 生成节点链接
+2. 卸载            停止 xray + 回滚 CF 配置(DNS/SSL/Origin Rules) + 清理本地状态/凭据/节点快照
+3. 查看节点        显示上次生成的节点链接
+4. 修改配置        修改 UUID / 端口 / WS 路径
+5. 查看当前配置    显示域名、UUID、端口映射、xray 服务状态、节点链接
 6. 更新外部端口    NAT 换端口专用：只更新 CF Origin Rules，不重启 xray
 ```
 
@@ -75,22 +75,18 @@ x
 |------|------|--------|
 | 域名 | 绑定到 CF 的子域名 | 必填 |
 | CF 凭据 | 邮箱 + Global API Key | 首次必填，之后自动复用 |
-| 协议 | vless / trojan / vmess | 全部 |
+| 协议 | vless | vless |
 | UUID | 节点身份标识 | 自动生成 |
 | 端口 | xray 监听端口 | 随机（直连）/ 手动输入映射（NAT） |
 | WS 路径前缀 | WebSocket 路径 | `/{UUID前8位}` |
 
 ## NAT 端口映射
 
-脚本自动检测 NAT 环境。安装时按提示输入端口映射：
+脚本自动检测 NAT 环境。安装时输入端口映射：
 
 ```
 vless 内部监听端口(xray监听): 80
 vless 外部映射端口(对外暴露): 15331
-trojan 内部监听端口(xray监听): 8080
-trojan 外部映射端口(对外暴露): 15333
-vmess 内部监听端口(xray监听): 8443
-vmess 外部映射端口(对外暴露): 15334
 ```
 
 - 内部端口 = xray 在容器内监听的端口
@@ -115,7 +111,7 @@ xray 进程崩溃后 1 秒自动拉起，无限重启：
 | xray 配置 | `/usr/local/etc/xray/config.json` | 自动生成 |
 | 状态记录 | `/etc/xray-cf-lite/state.json` | 卸载回滚依据 |
 | CF 凭据 | `/etc/xray-cf-lite/cf_account.json` | 权限 600 |
-| 订阅快照 | `./cf_lite_last_links.txt` | 运行目录下 |
+| 节点快照 | `./cf_lite_last_links.txt` | 运行目录下 |
 | OpenRC 服务 | `/etc/init.d/xray` | 仅 OpenRC 环境 |
 
 ## 工作原理
@@ -125,18 +121,18 @@ xray 进程崩溃后 1 秒自动拉起，无限重启：
 ```
 
 - Cloudflare 代理域名，客户端通过 CDN 连接
-- Origin Rules 将不同路径的请求转发到不同端口
+- Origin Rules 将请求转发到指定端口
 - SSL 模式设为 `flexible`（CF 到源站用 HTTP）
-- xray 使用 WebSocket 传输，每个协议监听独立端口
-- 订阅链接通过 `yx-auto.pages.dev` 生成，包含多个 CF 优选 IP
+- xray 使用 WebSocket 传输，监听独立端口
+- 输出单个 VLESS 节点链接，直连域名（走 CF 橙云 + Origin Rules）
 
 ## 注意事项
 
 - 安装时自动关闭 Bot Fight Mode / Security Level / Browser Check，卸载时自动恢复原值
-- 卸载会完整恢复 CF 配置（DNS 记录、SSL 模式、Origin Rules）到安装前状态，并清理本地 state.json / cf_account.json / 订阅快照
+- 卸载会完整恢复 CF 配置（DNS 记录、SSL 模式、Origin Rules）到安装前状态，并清理本地 state.json / cf_account.json / 节点快照
 - CF 凭据保存在服务器本地，不会上传到任何地方；输入时会实时校验，错误可当场重输（不会直接退出）
 - 一台服务器同时只支持一组部署（再次安装需先卸载）
 
 ## 致谢
 
-订阅服务基于 [xui-cf-deployer](https://github.com/byJoey/xui-cf-deployer) 项目的 `yx-auto.pages.dev`。
+本项目思路参考 [xui-cf-deployer](https://github.com/byJoey/xui-cf-deployer)。
