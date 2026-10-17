@@ -801,6 +801,10 @@ export ARGO_LOG_FILE="/var/log/singbox_argo.log"
 export RUNTIME_DIR="/run/singboxlite"
 export PID_FILE="${RUNTIME_DIR}/sing-box.pid"
 export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
+# 固定隧道统一本地端口 + Cloudflare API (邮箱+Global API Key 自动部署)
+export ARGO_FIXED_PORT="8080"
+export CF_API_BASE="https://api.cloudflare.com/client/v4"
+export CF_ACCOUNT_FILE="${SINGBOX_DIR}/cf_account.json"
 export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
 export DEP_STATE_VERSION="20260831-lowmem-1"
 _detect_init_system
@@ -1446,6 +1450,198 @@ _stop_all_argo_tunnels() {
 }
 
 # ============================================================
+# Cloudflare API 自动部署（固定隧道）
+# 凭据: 邮箱 + Global API Key；自动完成三件事:
+#   1) 创建命名隧道 (隧道名 = 二级域名前缀, 如 abc.example.com -> abc)
+#   2) 写入云端 ingress (统一 http://127.0.0.1:8080)
+#   3) 自动创建 DNS CNAME (橙云 proxied, 指向 <tunnel_id>.cfargotunnel.com)
+# 删除节点/卸载时统一删除云端隧道与 DNS 记录。
+# ============================================================
+CF_EMAIL="" CF_KEY="" CF_ACCOUNT_ID=""
+
+_cf_load_account() {
+    [ -s "$CF_ACCOUNT_FILE" ] || return 1
+    CF_EMAIL=$(jq -r '.email // ""' "$CF_ACCOUNT_FILE" 2>/dev/null)
+    CF_KEY=$(jq -r '.api_key // ""' "$CF_ACCOUNT_FILE" 2>/dev/null)
+    CF_ACCOUNT_ID=$(jq -r '.account_id // ""' "$CF_ACCOUNT_FILE" 2>/dev/null)
+    [ -n "$CF_EMAIL" ] && [ -n "$CF_KEY" ]
+}
+
+_cf_save_account() {
+    mkdir -p "$SINGBOX_DIR" 2>/dev/null || return 1
+    jq -n --arg e "$CF_EMAIL" --arg k "$CF_KEY" --arg a "$CF_ACCOUNT_ID" \
+        '{email: $e, api_key: $k, account_id: $a}' > "$CF_ACCOUNT_FILE" 2>/dev/null || return 1
+    chmod 600 "$CF_ACCOUNT_FILE" 2>/dev/null || true
+    return 0
+}
+
+_cf_verify_credentials() {
+    local r
+    r=$(curl -sS --connect-timeout 10 --max-time 30 \
+        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" \
+        -H "Content-Type: application/json" \
+        "${CF_API_BASE}/zones?per_page=1" 2>/dev/null || true)
+    printf '%s' "$r" | jq -e '.success == true' >/dev/null 2>&1
+}
+
+_prompt_cf_account() {
+    if _cf_load_account; then
+        local masked="${CF_KEY:0:6}...${CF_KEY: -4}"
+        read -rp "检测到已保存的 Cloudflare 凭据 (${CF_EMAIL}, Key=${masked})，复用? (Y/n): " cf_reuse
+        if [[ ! "${cf_reuse,,}" =~ ^(n|no)$ ]] && _cf_verify_credentials; then
+            return 0
+        fi
+    fi
+    while true; do
+        read -rp "Cloudflare 邮箱: " CF_EMAIL || return 1
+        read -rsp "Cloudflare Global API Key: " CF_KEY || return 1
+        echo ""
+        if [ -z "$CF_EMAIL" ] || [ -z "$CF_KEY" ]; then
+            _warning "邮箱与 Global API Key 不能为空，请重新输入。"
+            continue
+        fi
+        _info "正在校验 Cloudflare 凭据..."
+        if _cf_verify_credentials; then
+            _success "Cloudflare 凭据校验通过 (凭据已保存到 ${CF_ACCOUNT_FILE})"
+            _cf_save_account || _warning "凭据保存失败，本次会话仍可继续。"
+            return 0
+        fi
+        _error "Cloudflare 凭据校验失败，请重新输入 (Ctrl+C 退出)。"
+    done
+}
+
+# 统一 CF API 调用入口 (需要 CF_EMAIL/CF_KEY 已就绪)
+_cf_call() {
+    local method="$1" endpoint="$2" data="${3:-}"
+    local args=(curl -sS --connect-timeout 10 --max-time 30 -X "$method"
+        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY"
+        -H "Content-Type: application/json")
+    [ -n "$data" ] && args+=(-d "$data")
+    local r
+    r=$("${args[@]}" "${CF_API_BASE}${endpoint}" 2>/dev/null) || true
+    if ! printf '%s' "$r" | jq -e '.success == true' >/dev/null 2>&1; then
+        local msg
+        msg=$(printf '%s' "$r" | jq -r '[.errors[]?.message] | join("; ")' 2>/dev/null)
+        _error "Cloudflare API 错误 [$method $endpoint]: ${msg:-无响应或网络错误}"
+        return 1
+    fi
+    printf '%s' "$r"
+}
+
+# 隧道名称: 取二级域名前缀 (abc.example.com -> abc ; a.b.c.example.com -> a)
+_argo_tunnel_name_from_domain() {
+    local domain="$1"
+    domain="${domain%%.}"
+    printf '%s' "$domain" | awk -F. '{print $1}' | tr -cd 'a-zA-Z0-9-_'
+}
+
+_cf_find_zone() {
+    local domain="$1" zones best_name="" best_id="" best_acct="" zone_name zone_id acct_id
+    zones=$(_cf_call GET "/zones?per_page=100") || return 1
+    zones=$(printf '%s' "$zones" | jq -r '.result[] | "\(.name) \(.id) \(.account.id)"' 2>/dev/null)
+    while read -r zone_name zone_id acct_id; do
+        [ -n "$zone_name" ] || continue
+        if [ "$domain" == "$zone_name" ] || [[ "$domain" == *".$zone_name" ]]; then
+            if [ ${#zone_name} -gt ${#best_name} ]; then
+                best_name="$zone_name"; best_id="$zone_id"; best_acct="$acct_id"
+            fi
+        fi
+    done <<< "$zones"
+    [ -n "$best_id" ] || return 1
+    printf '%s %s\n' "$best_id" "$best_acct"
+}
+
+_cf_create_tunnel() {
+    local tname="$1"
+    [ -n "$CF_ACCOUNT_ID" ] || { _error "Cloudflare Account ID 为空，无法创建隧道。"; return 1; }
+    printf '%s' "$(_cf_call POST "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
+        "$(jq -n --arg n "$tname" '{name: $n, config_src: "cloudflare"}')")" \
+        | jq -r '.result | "\(.id) \(.token)"'
+}
+
+_cf_set_ingress() {
+    local tunnel_id="$1" domain="$2" port="$3"
+    _cf_call PUT "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tunnel_id}/configurations" \
+        "$(jq -n --arg h "$domain" --argjson p "$port" \
+            '{config: {ingress: [{hostname: $h, service: ("http://127.0.0.1:" + ($p|tostring))}, {service: "http_status:404"}]}}')" >/dev/null
+}
+
+_cf_ensure_cname() {
+    local zone_id="$1" domain="$2" tunnel_id="$3"
+    local target="${tunnel_id}.cfargotunnel.com"
+    local rec existing_id existing_content
+    rec=$(_cf_call GET "/zones/${zone_id}/dns_records?type=CNAME&name=${domain}") || return 1
+    existing_id=$(printf '%s' "$rec" | jq -r '.result[0].id // ""' 2>/dev/null)
+    existing_content=$(printf '%s' "$rec" | jq -r '.result[0].content // ""' 2>/dev/null)
+    if [ -n "$existing_id" ] && [ "$existing_content" == "$target" ]; then
+        _info "DNS 解析已存在且指向正确: ${domain} -> ${target}"
+        return 0
+    fi
+    if [ -n "$existing_id" ]; then
+        _info "删除旧的 CNAME 记录 (${existing_content})..."
+        _cf_call DELETE "/zones/${zone_id}/dns_records/${existing_id}" >/dev/null || true
+    fi
+    _cf_call POST "/zones/${zone_id}/dns_records" \
+        "$(jq -n --arg n "$domain" --arg c "$target" '{type: "CNAME", name: $n, content: $c, proxied: true, ttl: 1}')" >/dev/null
+    _success "DNS 解析已自动创建: ${domain} -> ${target} (proxied)"
+}
+
+_cf_delete_tunnel() {
+    _cf_call DELETE "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${1}" >/dev/null
+}
+
+# 删除域名下同名 DNS 记录 (CNAME/A 等都清理)
+_cf_delete_zone_records() {
+    local zone_id="$1" domain="$2" rids rid
+    rids=$(_cf_call GET "/zones/${zone_id}/dns_records?name=${domain}") || return 1
+    rids=$(printf '%s' "$rids" | jq -r '.result[]?.id // empty' 2>/dev/null)
+    [ -n "$rids" ] || { _info "未找到 ${domain} 的 DNS 记录。"; return 0; }
+    while IFS= read -r rid; do
+        [ -n "$rid" ] || continue
+        if _cf_call DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null 2>&1; then
+            _success "DNS 记录已删除 (${domain})"
+        fi
+    done <<< "$rids"
+    return 0
+}
+
+# 清理某固定隧道节点的云端资源 (隧道 + DNS)
+_cf_cleanup_tunnel() {
+    local tunnel_id="$1" zone_id="$2" domain="$3"
+    if [ -z "$tunnel_id" ]; then
+        _warning "该节点未记录隧道 ID (旧版 Token 部署)，已跳过云端删除，请手动在 CF 控制台删除。"
+        return 0
+    fi
+    if ! _cf_load_account; then
+        _warning "未找到已保存的 Cloudflare 凭据，已跳过云端删除 (隧道: ${tunnel_id})，请手动清理。"
+        return 0
+    fi
+    _info "正在删除 Cloudflare 云端隧道 (${tunnel_id})..."
+    if _cf_delete_tunnel "$tunnel_id" 2>/dev/null; then
+        _success "云端隧道已删除。"
+    else
+        _warning "云端隧道删除失败 (可能已被手动删除)，继续本地清理。"
+    fi
+    if [ -n "$zone_id" ] && [ -n "$domain" ]; then
+        _cf_delete_zone_records "$zone_id" "$domain" 2>/dev/null || _warning "DNS 记录删除失败，请手动检查。"
+    fi
+    return 0
+}
+
+# 按节点 tag 从元数据读取并清理云端资源
+_cf_remove_for_node_key() {
+    local tag="$1" ftype tunnel_id zone_id domain
+    [ -n "$tag" ] || return 0
+    [ -f "$ARGO_METADATA_FILE" ] || return 0
+    ftype=$(jq -r --arg tag "$tag" '.[$tag].type // ""' "$ARGO_METADATA_FILE" 2>/dev/null)
+    [ "$ftype" == "fixed" ] || return 0
+    tunnel_id=$(jq -r --arg tag "$tag" '.[$tag].tunnel_id // ""' "$ARGO_METADATA_FILE" 2>/dev/null)
+    zone_id=$(jq -r --arg tag "$tag" '.[$tag].zone_id // ""' "$ARGO_METADATA_FILE" 2>/dev/null)
+    domain=$(jq -r --arg tag "$tag" '.[$tag].domain // ""' "$ARGO_METADATA_FILE" 2>/dev/null)
+    _cf_cleanup_tunnel "$tunnel_id" "$zone_id" "$domain"
+}
+
+# ============================================================
 # 统一 Argo 节点创建函数 (VLESS/Trojan)
 # 参数: $1 = 协议类型 ("vless" 或 "trojan")
 # ============================================================
@@ -1463,20 +1659,7 @@ _add_argo_node() {
 
     _install_cloudflared || return 1
 
-    read -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
-    local port="$input_port"
-
-    while true; do
-        if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
-            _check_port_conflict "$port" "tcp" && port="" && continue
-            _info "已使用监听端口: ${port}"
-            break
-        else
-            [ -n "$port" ] && _warning "端口格式无效，将重新生成..."
-            port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
-            _info "正在尝试分配随机内部端口: ${port}..."
-        fi
-    done
+    local port="" token="" tunnel_domain="" argo_type="temp" tunnel_id="" zone_id="" tunnel_name="" tr_tunnel=""
 
     read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
     if [ -z "$ws_path" ]; then
@@ -1498,46 +1681,110 @@ _add_argo_node() {
     echo ""
     echo "请选择隧道模式:"
     echo "  1. 临时隧道 (无需配置, 随机域名, 不稳定，重启失效)"
-    echo "  2. 固定隧道 (需 Token, 自定义域名, 稳定持久，重启不失效)"
+    echo "  2. 固定隧道 (需 CF 邮箱+Global API Key, 自动创建隧道和DNS, 稳定持久)"
     read -p "请选择 [1/2] (默认: 1): " tunnel_mode
     tunnel_mode=${tunnel_mode:-1}
 
-    local token=""
-    local tunnel_domain=""
-    local argo_type="temp"
-
     if [ "$tunnel_mode" == "2" ]; then
         argo_type="fixed"
-        _info "您选择了 [固定隧道] 模式。"
-        echo ""
-        _info "请粘贴 Cloudflare Tunnel Token (支持直接粘贴CF网页端所给出的任何安装命令):"
-        read -p "Token: " input_token
-        token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' | head -1)
-        if [ -z "$token" ]; then
-             token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]{20,}' | head -1)
-        fi
-        if [ -z "$token" ]; then
-             token="$input_token"
+        _info "您选择了 [固定隧道] 模式 (Cloudflare API 自动部署)。"
+
+        if ! _prompt_cf_account; then
+            _error "未获得有效的 Cloudflare 凭据，已取消创建。"
+            return 1
         fi
 
-        if [ -z "$token" ]; then _error "Token 不能为空"; return 1; fi
-        _info "已识别 Token (前20位): ${token:0:20}..."
+        local pref_domain="" zinfo=""
+        while true; do
+            read -p "请输入绑定域名 (例如 abc.example.com): " pref_domain
+            if [ -z "$pref_domain" ]; then
+                _warning "域名不能为空，请重试。"
+                continue
+            fi
+            if zinfo=$(_cf_find_zone "$pref_domain"); then
+                zone_id=$(echo "$zinfo" | awk '{print $1}')
+                CF_ACCOUNT_ID=$(echo "$zinfo" | awk '{print $2}')
+                _cf_save_account || _warning "保存 Cloudflare 凭据失败。"
+                _success "匹配到 Zone: $zone_id"
+                break
+            fi
+            _error "无法在当前 Cloudflare 账号下匹配 Zone: ${pref_domain}，请确认域名已托管 (Ctrl+C 退出)"
+        done
+        tunnel_domain="$pref_domain"
+
+        tunnel_name=$(_argo_tunnel_name_from_domain "$tunnel_domain")
+        if [ -z "$tunnel_name" ]; then
+            _error "无法从域名提取隧道名: ${tunnel_domain}"
+            return 1
+        fi
+        _info "隧道名 (二级域名前缀): ${tunnel_name}"
+
+        port="$ARGO_FIXED_PORT"
+        if _check_port_conflict "$port" "tcp"; then
+            _error "固定隧道统一使用本地端口 ${port}，但该端口已被占用。"
+            _error "请先删除占用该端口的现有节点后再试。"
+            return 1
+        fi
 
         echo ""
-        _info "请输入该 Tunnel 绑定的域名 (用于生成客户端配置):"
-        read -p "域名 (例如 tunnel.example.com): " input_domain
-        if [ -z "$input_domain" ]; then _error "域名不能为空"; return 1; fi
-        tunnel_domain="$input_domain"
+        echo "配置预览:"
+        echo "  内核:     sing-box (${protocol_label})"
+        echo "  绑定域名: ${tunnel_domain}"
+        echo "  隧道名:   ${tunnel_name} (二级域名前缀)"
+        echo "  本地服务: http://127.0.0.1:${port} (sing-box 监听)"
+        echo "  DNS:      服务器为您自动解析本隧道 (橙云, http://127.0.0.1:${port} 流量映射)"
+        echo ""
+        read -p "确认部署? (Y/n): " confirm_fix
+        if [[ ! "${confirm_fix,,}" =~ ^(|y|yes)$ ]]; then
+            _info "已取消部署。"
+            return 1
+        fi
 
-        echo ""
-        _info "【重要提示】请务必去 Cloudflare Dashboard 配置该 Tunnel 的 Public Hostname:"
-        _info "  Public Hostname: ${tunnel_domain}"
-        _info "  Service: http://localhost:${port}"
-        echo ""
-        read -n 1 -s -r -p "确认配置无误后，按任意键继续..."
-        echo ""
+        _info "创建 Cloudflare Tunnel (${tunnel_name})..."
+        if ! tr_tunnel=$(_cf_create_tunnel "$tunnel_name"); then
+            _error "创建隧道失败，已取消部署。"
+            return 1
+        fi
+        tunnel_id=$(echo "$tr_tunnel" | awk '{print $1}')
+        token=$(echo "$tr_tunnel" | awk '{print $2}')
+        if [ -z "$tunnel_id" ] || [ -z "$token" ]; then
+            _error "创建隧道返回数据异常，已取消部署。"
+            return 1
+        fi
+        _success "隧道已创建: ${tunnel_name} (${tunnel_id})"
+
+        _info "配置隧道入口 (ingress)..."
+        if ! _cf_set_ingress "$tunnel_id" "$tunnel_domain" "$port"; then
+            _error "配置 ingress 失败，正在回滚云端隧道..."
+            _cf_delete_tunnel "$tunnel_id" 2>/dev/null || true
+            return 1
+        fi
+
+        _info "自动添加 DNS 解析..."
+        if ! _cf_ensure_cname "$zone_id" "$tunnel_domain" "$tunnel_id"; then
+            _error "DNS 解析创建失败，正在回滚云端隧道..."
+            _cf_delete_tunnel "$tunnel_id" 2>/dev/null || true
+            return 1
+        fi
+
+        _success "云端配置完成: ${tunnel_domain} -> http://127.0.0.1:${port} (无需手动配置 CF 后台)"
     else
         _info "您选择了 [临时隧道] 模式。"
+
+        read -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
+        port="$input_port"
+
+        while true; do
+            if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
+                _check_port_conflict "$port" "tcp" && port="" && continue
+                _info "已使用监听端口: ${port}"
+                break
+            else
+                [ -n "$port" ] && _warning "端口格式无效，将重新生成..."
+                port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
+                _info "正在尝试分配随机内部端口: ${port}..."
+            fi
+        done
     fi
 
     local default_prefix="Argo-Temp"
@@ -1608,6 +1855,7 @@ _add_argo_node() {
         if ! _start_argo_tunnel "$port" "${protocol}-ws" "$token"; then
              _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
              _manage_service "restart"
+             _cf_cleanup_tunnel "$tunnel_id" "$zone_id" "$tunnel_domain" 2>/dev/null || true
              return 1
         fi
     else
@@ -1639,8 +1887,10 @@ _add_argo_node() {
         --arg protocol "${protocol}-ws" \
         --arg type "$argo_type" \
         --arg token "$token" \
+        --arg tunnel_id "$tunnel_id" \
+        --arg zone_id "$zone_id" \
         --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
-        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), ($cred_key): $cred_val, path: $path, protocol: $protocol, type: $type, token: $token, created_at: $created}}')
+        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), ($cred_key): $cred_val, path: $path, protocol: $protocol, type: $type, token: $token, tunnel_id: $tunnel_id, zone_id: $zone_id, created_at: $created}}')
 
     if [ ! -f "$ARGO_METADATA_FILE" ]; then
         echo '{}' > "$ARGO_METADATA_FILE"
@@ -1851,6 +2101,8 @@ _delete_argo_node() {
     local selected_port="${ports[$idx]}"
 
     _info "正在删除节点: ${selected_name} (端口: ${selected_port})..."
+
+    _cf_remove_for_node_key "$selected_key"
 
     _stop_argo_tunnel "$selected_port"
 
@@ -2157,6 +2409,7 @@ _uninstall_argo() {
     echo "即将删除的内容："
     echo -e "  ${RED}-${NC} cloudflared 程序: ${CLOUDFLARED_BIN}"
     echo -e "  ${RED}-${NC} 所有 Argo 日志文件和元数据文件"
+    echo -e "  ${RED}-${NC} 固定隧道的云端资源 (Cloudflare Tunnel 与其 DNS 解析记录)"
 
     if [ -f "$ARGO_METADATA_FILE" ]; then
         local argo_count=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null || echo "0")
@@ -2182,6 +2435,7 @@ _uninstall_argo() {
         for tag in "${tags[@]}"; do
              if [ -n "$tag" ]; then
                 _info "正在删除 Argo 隧道: $tag ..."
+                _cf_remove_for_node_key "$tag" 2>/dev/null || true
                 node_name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
                 _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" 2>/dev/null
                 _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag"
@@ -2206,7 +2460,7 @@ _uninstall_argo() {
 
     rm -f "$RUNTIME_DIR"/argo-*.pid /var/log/singbox_argo_*.log
     rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
-    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}"
+    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}" "${CF_ACCOUNT_FILE}"
     rm -rf "/etc/cloudflared"
 
     _manage_service "restart"
@@ -2513,6 +2767,14 @@ _uninstall() {
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl reset-failed sing-box.service >/dev/null 2>&1 || true
+    fi
+
+    # 先用元数据+已存凭据清理云端固定隧道与 DNS 记录 (必须在删除配置目录之前)
+    _info "正在清理 Cloudflare 云端固定隧道资源..."
+    if [ -f "$ARGO_METADATA_FILE" ]; then
+        while IFS= read -r _mtag; do
+            [[ -n "$_mtag" ]] && _cf_remove_for_node_key "$_mtag" 2>/dev/null || true
+        done < <(jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null)
     fi
 
     _info "正在清理运行规则与配置文件..."
