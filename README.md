@@ -32,6 +32,7 @@
 - 域名已托管在 Cloudflare
 - 账号邮箱 + **Global API Key**（在 [Cloudflare Dashboard](https://dash.cloudflare.com/profile/api-tokens) -> API Keys -> Global API Key 查看）
 - 脚本会自动处理 CF 安全规则（Bot Fight Mode、Security Level、Browser Check），无需手动操作
+- 使用「严格」SSL 模式时，脚本会自动生成 CF Origin 证书（需 `SSL and Certificates: Edit` 权限）
 
 ### NAT 环境
 
@@ -79,6 +80,7 @@ x
 | UUID | 节点身份标识 | 自动生成 |
 | 端口 | xray 监听端口 | 随机（直连）/ 手动输入映射（NAT） |
 | WS 路径前缀 | WebSocket 路径 | `/{UUID前8位}` |
+| SSL 模式 | 严格 Full Strict（源站 HTTPS + Origin 证书）/ 灵活 Flexible | 严格 |
 
 ## NAT 端口映射
 
@@ -122,7 +124,9 @@ xray 进程崩溃后 1 秒自动拉起，无限重启：
 
 - Cloudflare 代理域名，客户端通过 CDN 连接
 - Origin Rules 将请求转发到指定端口
-- SSL 模式设为 `flexible`（CF 到源站用 HTTP）
+- SSL 模式默认 `strict`（Full Strict）：CF 用 HTTPS 连源站并校验 Origin 证书
+- 灵活模式 `flexible`：CF 到源站用 HTTP（配置更简单，但源站明文）
+- 严格模式由脚本自动生成 CF Origin 证书（有效期 15 年，免续期）并配置到 xray
 - xray 使用 WebSocket 传输，监听独立端口
 - 输出单个 VLESS 节点链接，直连域名（走 CF 橙云 + Origin Rules）
 
