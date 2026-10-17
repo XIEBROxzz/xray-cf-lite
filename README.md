@@ -1,6 +1,6 @@
 # xray-cf-lite
 
-最小化 xray + Cloudflare 节点部署脚本。一个 Bash 脚本，无需面板。
+最小化代理节点 + Cloudflare 部署脚本。一个 Bash 脚本，无需面板。含两个版本：**版本 A（xray + Origin Rules，需公网 IP）** 与 **版本 B（sing-box + Argo 隧道，无需公网 IP）**。
 
 ## 适用场景
 
@@ -29,7 +29,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 
 快捷命令：`x`
 
-### 版本 B：Cloudflare Tunnel（无需公网 IP / 端口映射）
+### 版本 B：Cloudflare Tunnel（无需公网 IP / 端口映射，内核 sing-box）
 
 ```bash
 apk add bash curl jq
@@ -38,14 +38,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 
 快捷命令：`xt`
 
+- 内核 **sing-box**，协议 VLESS + WebSocket
+- 本地监听**固定端口 8080**，服务地址 `http://127.0.0.1:8080`
+- 隧道名自动取**二级域名前缀**（如 `abc.example.com` → `abc`）
+- 自动创建 DNS CNAME（橙云 `proxied:true`，走 Argo 隧道）
+- 域名只需托管到 CF，无需公网 IP / 端口映射
+
 | | 版本 A | 版本 B |
 |---|---|---|
-| 接入方式 | DNS + Origin Rules | cloudflared 隧道 |
+| 内核 | xray-core | sing-box |
+| 接入方式 | DNS + Origin Rules | cloudflared 隧道（Argo） |
 | 公网 IP | 需要 | 不需要 |
 | 端口映射（NAT） | 需要 | 不需要 |
+| 监听端口 | 随机 / 手动 | 固定 8080 |
 | 快捷命令 | `x` | `xt` |
 
 ## 功能
+
+> 以下为 **版本 A（xray_cf_lite.sh）** 的功能；版本 B 的功能见上文「版本 B」说明。
 
 ```
 1. 安装节点        部署 xray + 配置 CF（DNS/SSL/Origin Rules）+ 生成节点链接
@@ -56,7 +66,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 6. 更新外部端口    NAT 换端口专用：只更新 CF Origin Rules，不重启 xray
 ```
 
-## 可选项
+## 可选项（版本 A）
 
 | 选项 | 说明 | 默认值 |
 |------|------|--------|
@@ -68,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 | WS 路径前缀 | WebSocket 路径 | `/{UUID前8位}` |
 | SSL 模式 | 严格 Full Strict / 灵活 Flexible | 严格 |
 
-## SSL 模式
+## SSL 模式（版本 A）
 
 | 模式 | CF → 源站 | 源站证书 | 说明 |
 |------|-----------|---------|------|
@@ -77,7 +87,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 
 严格模式全程自动：生成 key + CSR → CF API 签发 Origin 证书 → 配置到 xray（TLS）→ CF SSL 设为 `strict`。
 
-## 工作原理
+## 工作原理（版本 A）
 
 ```
 客户端 → CF CDN (443/TLS) → Origin Rules → 源站外部端口 → NAT → xray 内部端口
@@ -96,3 +106,4 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 ---
 
 思路参考 [xui-cf-deployer](https://github.com/byJoey/xui-cf-deployer)。
+
