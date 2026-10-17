@@ -8,6 +8,9 @@ XRAY_BINARY="/usr/local/bin/xray"
 STATE_DIR="/etc/xray-cf-lite"
 STATE_PATH="$STATE_DIR/state.json"
 CF_ACCOUNT_PATH="$STATE_DIR/cf_account.json"
+ORIGIN_CERT_PATH="$STATE_DIR/origin.pem"
+ORIGIN_KEY_PATH="$STATE_DIR/origin.key"
+ORIGIN_CSR_PATH="$STATE_DIR/origin.csr"
 LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
 
 CF_API="https://api.cloudflare.com/client/v4"
@@ -55,9 +58,10 @@ detect_init() {
 # ── 包管理器 ──────────────────────────────────────────
 install_deps() {
     local missing=()
-    command -v curl  &>/dev/null || missing+=(curl)
-    command -v jq    &>/dev/null || missing+=(jq)
-    command -v unzip &>/dev/null || missing+=(unzip)
+    command -v curl    &>/dev/null || missing+=(curl)
+    command -v jq      &>/dev/null || missing+=(jq)
+    command -v unzip   &>/dev/null || missing+=(unzip)
+    command -v openssl &>/dev/null || missing+=(openssl)
     [[ ${#missing[@]} -eq 0 ]] && return
 
     echo "安装依赖: ${missing[*]}"
@@ -418,6 +422,32 @@ apply_origin_rules() {
     cf_put_origin_rules "$zone_id" "$merged"
 }
 
+# ── CF Origin 证书（Full Strict 用）──────────────────
+# 生成 key + CSR，调 CF API 签发 Origin 证书并保存到 STATE_DIR。
+# 证书由 CF 信任、有效期 15 年，无需续期；CF SSL 设 strict 时启用。
+cf_setup_origin_cert() {
+    local zone_id="$1" domain="$2"
+    info "生成 Origin 证书（Full Strict）..."
+    openssl req -new -newkey rsa:2048 -nodes \
+        -keyout "$ORIGIN_KEY_PATH" \
+        -out "$ORIGIN_CSR_PATH" \
+        -subj "/CN=${domain}" 2>/dev/null \
+        || die "生成 CSR 失败"
+
+    local csr_pem payload r cert
+    csr_pem=$(cat "$ORIGIN_CSR_PATH")
+    payload=$(jq -n --arg csr "$csr_pem" --arg d "$domain" \
+        '{csr:$csr, hostnames:[$d], request_type:"origin-rsa", requested_validity:5475}')
+    r=$(cf_call_raw POST "/certificates" "$payload")
+    cert=$(echo "$r" | jq -r '.result.certificate // empty')
+    [[ -n "$cert" ]] || die "创建 Origin 证书失败: $(echo "$r" | jq -c '.errors // empty')"
+
+    echo "$cert" > "$ORIGIN_CERT_PATH"
+    chmod 600 "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH"
+    rm -f "$ORIGIN_CSR_PATH"
+    ok "Origin 证书已保存: $ORIGIN_CERT_PATH"
+}
+
 # ── xray 安装 ─────────────────────────────────────────
 install_xray() {
     echo "正在安装 xray-core ..."
@@ -512,9 +542,15 @@ external_routing_rules() {
 }
 
 gen_xray_config() {
-    local routes_json="$1" uid="$2"
+    local routes_json="$1" uid="$2" ssl_mode="${3:-flexible}"
+    local security="none" tls_json="null"
+    if [[ "$ssl_mode" == "strict" ]]; then
+        security="tls"
+        tls_json=$(jq -n --arg c "$ORIGIN_CERT_PATH" --arg k "$ORIGIN_KEY_PATH" \
+            '{certificates:[{certificateFile:$c,keyFile:$k}], alpn:["http/1.1"]}')
+    fi
     local inbounds
-    inbounds=$(echo "$routes_json" | jq --arg uid "$uid" '[
+    inbounds=$(echo "$routes_json" | jq --arg uid "$uid" --arg sec "$security" --argjson tls "$tls_json" '[
         .[] | {
             tag: ("in-" + .protocol + "-" + (.listen_port|tostring)),
             listen: "0.0.0.0",
@@ -526,7 +562,8 @@ gen_xray_config() {
                 else {clients:[{id:$uid,alterId:0}]}
                 end
             ),
-            streamSettings: { network:"ws", security:"none", wsSettings:{path:.path} },
+            streamSettings: ( { network:"ws", security:$sec, wsSettings:{path:.path} }
+                              + (if $tls == null then {} else {tlsSettings:$tls} end) ),
             sniffing: { enabled:true, destOverride:["http","tls"] }
         }
     ]')
@@ -610,6 +647,18 @@ prompt_path_prefix() {
     [[ -z "$pfx" ]] && pfx="/${default}"
     [[ "$pfx" == /* ]] || pfx="/${pfx}"
     echo "$pfx"
+}
+
+prompt_ssl_mode() {
+    echo >&2
+    info "SSL 模式:" >&2
+    echo "  1 = 严格 Full Strict（推荐）：源站启用 HTTPS + Origin 证书，更安全" >&2
+    echo "  2 = 灵活 Flexible：源站走 HTTP，配置简单" >&2
+    read -rp "选择 SSL 模式 (1=严格, 2=灵活, 回车=严格): " ans
+    case "$ans" in
+        2) echo "flexible" ;;
+        *) echo "strict" ;;
+    esac
 }
 
 # 生成路由 JSON，NAT 和直连通用
@@ -706,6 +755,9 @@ do_install() {
     local path_prefix
     path_prefix=$(prompt_path_prefix "$short_id")
 
+    local ssl_mode
+    ssl_mode=$(prompt_ssl_mode)
+
     local routes_json
     routes_json=$(build_routes "$net_mode" "$path_prefix" "${#protocols[@]}" "${protocols[@]}")
 
@@ -715,6 +767,7 @@ do_install() {
     echo "  域名:  $domain"
     echo "  UUID:  $uid"
     echo "  模式:  $net_mode"
+    echo "  SSL:   $ssl_mode"
     echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
     echo
     read -rp "确认部署? (Y/n): " confirm
@@ -722,7 +775,10 @@ do_install() {
 
     # xray
     local config
-    config=$(gen_xray_config "$routes_json" "$uid")
+    if [[ "$ssl_mode" == "strict" ]]; then
+        cf_setup_origin_cert "$zone_id" "$domain"
+    fi
+    config=$(gen_xray_config "$routes_json" "$uid" "$ssl_mode")
     write_xray_config "$config"
     [[ "$INIT_SYSTEM" == "openrc" && ! -f "$XRAY_OPENRC_SCRIPT" ]] && write_openrc_script && ok "OpenRC 服务脚本已创建"
     restart_xray
@@ -737,8 +793,8 @@ do_install() {
 
     dns_record_id=$(cf_upsert_dns "$zone_id" "$domain" "$public_ip")
     ok "DNS A 记录: $domain -> $public_ip (已代理)"
-    cf_set_ssl "$zone_id" "flexible"
-    ok "SSL 模式: flexible"
+    cf_set_ssl "$zone_id" "$ssl_mode"
+    ok "SSL 模式: $ssl_mode"
     apply_origin_rules "$zone_id" "$domain" "$routes_json"
     ok "Origin Rules: ${#protocols[@]} 条"
 
@@ -763,11 +819,12 @@ do_install() {
     [[ -n "$routes_json" ]]         || routes_json="[]"
     save_state "$(jq -n \
         --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" \
+        --arg sslmode "$ssl_mode" \
         --argjson routes "$routes_json" \
         --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
         --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
         --argjson secbk "$security_backup" \
-        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,routes:$routes,
+        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,ssl_mode:$sslmode,routes:$routes,
           managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
           ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
 
@@ -819,7 +876,7 @@ do_uninstall() {
     fi
 
     remove_state
-    rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH"
+    rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH" "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH" "$ORIGIN_CSR_PATH"
     ok "已清理节点快照与 CF 凭据"
     ok "卸载完成"
 }
@@ -920,7 +977,7 @@ do_modify() {
 
     [[ "$changed" == "true" ]] || { echo "无修改"; return; }
 
-    write_xray_config "$(gen_xray_config "$new_routes" "$new_uid")"
+    write_xray_config "$(gen_xray_config "$new_routes" "$new_uid" "$(echo "$state" | jq -r '.ssl_mode // "flexible"')")"
     restart_xray
 
     if load_cf_account; then
@@ -945,6 +1002,7 @@ do_show_config() {
     echo "域名:  $(echo "$state" | jq -r '.domain')"
     echo "UUID:  $(echo "$state" | jq -r '.uuid')"
     echo "模式:  $(echo "$state" | jq -r '.net_mode // "direct"')"
+    echo "SSL:   $(echo "$state" | jq -r '.ssl_mode // "flexible"')"
     echo
     echo "入站:"
     echo "$state" | jq -r '.routes[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
