@@ -30,7 +30,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 ```
 1. 安装节点        部署 xray + 配置 CF（DNS/SSL/Origin Rules）+ 生成节点链接
 2. 卸载            停止 xray + 回滚 CF 配置 + 清理本地状态/凭据/证书
-3. 查看节点        显示上次生成的节点链接
+3. 查看节点        查看节点链接 / 生成优选订阅
 4. 修改配置        修改 UUID / 端口 / WS 路径
 5. 查看当前配置    显示域名、UUID、端口映射、xray 状态、节点链接
 6. 更新外部端口    NAT 换端口专用：只更新 CF Origin Rules，不重启 xray
