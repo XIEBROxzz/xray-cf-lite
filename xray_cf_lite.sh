@@ -450,10 +450,9 @@ apply_origin_rules() {
     cf_put_origin_rules "$zone_id" "$merged"
 }
 
-# 删除节点专用：只移除「本脚本创建（description 带 xray-cf-lite 前缀）且
-# expression 目标 host 等于本节点域名」的 Origin Rule。
-# 匹配语义与 apply_origin_rules 完全一致；基于实时规则表过滤回写（不用旧备份），
-# 用户手工规则、其他节点的规则不受影响；失败不中断删除流程。
+# 删除节点专用：移除「expression 里带引号引用本节点域名」的 Origin Rule
+# （语义级匹配，eq/==/列表写法通吃，兼容旧版本脚本写入的规则式样）。
+# 基于实时规则表过滤回写（不用旧备份），其他规则不受影响；失败不中断删除流程。
 cf_remove_node_rules() {
     local zone_id="$1" domain="$2"
     local rules kept n nk r
