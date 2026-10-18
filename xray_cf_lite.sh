@@ -899,8 +899,9 @@ do_install() {
 
 # ── 删除节点核心清理（删除节点 / 卸载脚本 共用）──────
 # 原则：只清理本节点自身（xray 服务、本机配置、本节点域名的 DNS 解析、
-#       本节点域名的 Origin CA 证书吊销、本地证书文件）
-# 不碰任何 zone 级全局配置：SSL 模式 / Origin Rules / 安全规则(Bot Fight 等)都不动，
+#       本节点域名的 Origin CA 证书吊销、Origin Rules 中本节点自己的规则、本地证书文件）
+# 不碰任何 zone 级全局配置：SSL 模式 / 安全规则(Bot Fight 等)都不动，
+# Origin Rules 也只按「xray-cf-lite 前缀 + host eq 本节点域名」精准剔除，
 # 避免影响部署在同一域名下的其他节点。
 _delete_node_core() {
     local state="$1"
