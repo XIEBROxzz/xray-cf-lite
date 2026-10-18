@@ -1352,9 +1352,17 @@ ensure_shortcut() {
     if [[ -f "$target" ]] && grep -q "XIEBROxzz/xray-cf-lite" "$target"; then
         return
     fi
+    # 注意：不能用 bash 的 <() 进程替换——Debian 等系统 /bin/sh 是 dash，不认识该语法；
+    # 用 POSIX 兼容的临时文件方式，保证任何发行版都能跑
     cat > "$target" << 'SCEOF'
 #!/bin/sh
-exec bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_lite.sh) "$@"
+tmp=$(mktemp /tmp/xray-cf-lite.xXXXXXX) 2>/dev/null || exit 1
+trap 'rm -f "$tmp"' EXIT
+if ! curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_lite.sh -o "$tmp" 2>/dev/null; then
+    echo "下载主脚本失败，请检查网络后重试" >&2
+    exit 1
+fi
+bash "$tmp" "$@"
 SCEOF
     chmod +x "$target"
     ok "快捷命令 x 已更新指向本仓库"
