@@ -35,7 +35,7 @@ Cloudflare 需要**域名已托管**：
 ### 版本 A：DNS + Origin Rules（需公网 IP）
 
 ```bash
-apt-get install -y curl jq && bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_lite.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_lite.sh)
 ```
 
 安装后自动创建快捷命令 `x`（任何系统可直接 `x` 调起最新版）。
