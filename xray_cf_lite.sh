@@ -440,8 +440,8 @@ apply_origin_rules() {
     existing=$(cf_get_origin_rules "$zone_id")
     kept=$(echo "$existing" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
         .[] | select(
-            (.description | startswith($pfx) | not) or
-            (.expression | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"") | not)
+            (((.description // "") | startswith($pfx)) | not) or
+            (((.expression // "") | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"")) | not)
         )
     ]')
     new_managed=$(build_new_origin_rules "$domain" "$routes_json")
@@ -459,8 +459,8 @@ cf_remove_node_rules() {
     rules=$(cf_get_origin_rules "$zone_id")
     kept=$(echo "$rules" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
         .[] | select(
-            (.description | startswith($pfx) | not) or
-            (.expression | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"") | not)
+            (((.description // "") | startswith($pfx)) | not) or
+            (((.expression // "") | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"")) | not)
         )
     ]')
     n=$(echo "$rules" | jq 'length')
