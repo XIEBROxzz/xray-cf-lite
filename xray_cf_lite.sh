@@ -514,6 +514,22 @@ cf_setup_origin_cert() {
     ok "Origin 证书已保存: $ORIGIN_CERT_PATH"
 }
 
+# ── 服务用户授权 ─────────────────────────────────────
+# 官方 xray.service (systemd) 以 User=nobody 运行，而证书/私钥在 STATE_DIR(700 root)
+# → nobody 读不到，严格模式启动报 "open origin.pem: permission denied"
+# → 这里显式授权服务用户读取；OpenRC(Root) 与非 systemd 环境直接跳过，零影响
+grant_cert_access() {
+    command -v systemctl &>/dev/null || return 0
+    local su sg
+    su=$(systemctl show xray -p User --value 2>/dev/null)
+    [[ -n "$su" && "$su" != "root" ]] || return 0
+    sg=$(id -gn "$su" 2>/dev/null) || return 0
+    chown "$su" "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH" 2>/dev/null || true
+    chgrp "$sg" "$STATE_DIR" 2>/dev/null || true
+    chmod 750 "$STATE_DIR" 2>/dev/null || true
+    ok "已授权服务用户 ${su} 读取证书"
+}
+
 # ── xray 安装 ─────────────────────────────────────────
 install_xray() {
     echo "正在安装 xray-core ..."
@@ -843,6 +859,8 @@ do_install() {
     local config
     if [[ "$ssl_mode" == "strict" ]]; then
         cf_setup_origin_cert "$zone_id" "$domain"
+        # systemd 版 xray.service 以 nobody 运行，写完证书立刻授权其可读
+        grant_cert_access
     fi
     config=$(gen_xray_config "$routes_json" "$uid" "$ssl_mode")
     write_xray_config "$config"
