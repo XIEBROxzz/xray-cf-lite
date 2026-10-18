@@ -8,7 +8,6 @@
 ## 适用系统
 
 - **Debian / Ubuntu / Alpine**，root 权限（其他发行版不保证）
-- 支持 **systemd** 与 **OpenRC**（Alpine）
 
 ## 前置依赖
 
@@ -130,6 +129,3 @@ apt-get install -y curl jq && bash <(curl -fsSL https://raw.githubusercontent.co
 - AWS EC2 用「停止再启动」会更换公网 IP，绑 Elastic IP 才不变；IP 变化后重跑一次「删除节点 → 安装节点」即可重建解析
 - 两个版本的状态文件均可能包含 UUID、密码、Token，请勿公开上传
 
----
-
-思路参考 [xui-cf-deployer](https://github.com/byJoey/xui-cf-deployer)。
