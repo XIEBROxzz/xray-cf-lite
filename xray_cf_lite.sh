@@ -837,10 +837,12 @@ do_install() {
 }
 
 # ── 删除节点核心清理（删除节点 / 卸载脚本 共用）──────
-# 注意：不改动 SSL 模式；DNS 记录只精确删除本节点域名的解析
+# 原则：只清理本节点自身（xray 服务、本机配置、本节点域名的 DNS 解析、本地证书文件）
+# 不碰任何 zone 级全局配置：SSL 模式 / Origin Rules / 安全规则(Bot Fight 等)都不动，
+# 避免影响部署在同一域名下的其他节点。
 _delete_node_core() {
     local state="$1"
-    local domain zone_id rids rid sec_bk
+    local domain zone_id rids rid
 
     domain=$(echo "$state" | jq -r '.domain // ""')
 
@@ -849,35 +851,29 @@ _delete_node_core() {
     ok "xray 已停止"
 
     if ! load_cf_account; then
-        info "无 CF 凭据，跳过云端清理"
-        return 0
-    fi
-
-    zone_id=$(echo "$state" | jq -r '.zone_id // ""')
-    if [[ -z "$zone_id" ]]; then
-        info "state 中无 zone_id，跳过云端清理"
-        return 0
-    fi
-
-    # 恢复 Origin Rules 备份
-    cf_put_origin_rules "$zone_id" "$(echo "$state" | jq '.origin_rules_backup // []')"
-    ok "Origin Rules 已恢复"
-
-    # 恢复安全规则（Bot Fight / Security Level / Browser Check），不动 SSL 模式
-    sec_bk=$(echo "$state" | jq '.security_backup // null')
-    cf_restore_security "$zone_id" "$sec_bk"
-
-    # DNS：精确匹配本节点域名（二级域名），同名记录（CNAME/A 等）全部删除
-    rids=$(cf_call_raw GET "/zones/${zone_id}/dns_records?name=${domain}" 2>/dev/null | jq -r '.result[]?.id // empty' || true)
-    if [[ -n "$rids" ]]; then
-        while IFS= read -r rid; do
-            [[ -n "$rid" ]] || continue
-            cf_call_raw DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null 2>&1 || true
-        done <<< "$rids"
-        ok "DNS 解析已删除: $domain"
+        info "无 CF 凭据，跳过 DNS 清理"
     else
-        info "未找到 $domain 的 DNS 记录"
+        zone_id=$(echo "$state" | jq -r '.zone_id // ""')
+        if [[ -z "$zone_id" ]]; then
+            info "state 中无 zone_id，跳过 DNS 清理"
+        else
+            # DNS：精确匹配本节点域名（二级域名），同名记录（CNAME/A 等）全部删除
+            # 注意：不恢复备份、不动 zone 其他配置，确保不影响其他节点
+            rids=$(cf_call_raw GET "/zones/${zone_id}/dns_records?name=${domain}" 2>/dev/null | jq -r '.result[]?.id // empty' || true)
+            if [[ -n "$rids" ]]; then
+                while IFS= read -r rid; do
+                    [[ -n "$rid" ]] || continue
+                    cf_call_raw DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null 2>&1 || true
+                done <<< "$rids"
+                ok "DNS 解析已删除: $domain"
+            else
+                info "未找到 $domain 的 DNS 记录"
+            fi
+        fi
     fi
+
+    # 本地证书文件（Origin 证书/私钥/CSR）随节点一起清理
+    rm -f "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH" "$ORIGIN_CSR_PATH"
 }
 
 # ── 2. 删除节点 ──────────────────────────────────────
