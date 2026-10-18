@@ -438,10 +438,11 @@ apply_origin_rules() {
     local zone_id="$1" domain="$2" routes_json="$3"
     local existing kept new_managed merged
     existing=$(cf_get_origin_rules "$zone_id")
-    kept=$(echo "$existing" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
+    # 与删除侧同一套语义匹配：expression 里带引号引用本节点域名的规则先全部移除，
+    # 再写入最新规则（避免旧版本脚本写入的残留规则与本条并存）
+    kept=$(echo "$existing" | jq --arg d "$domain" '[
         .[] | select(
-            (((.description // "") | startswith($pfx)) | not) or
-            (((.expression // "") | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"")) | not)
+            (((.expression // "") | ascii_downcase | contains("\"" + ($d|ascii_downcase) + "\""))) | not
         )
     ]')
     new_managed=$(build_new_origin_rules "$domain" "$routes_json")
@@ -457,15 +458,19 @@ cf_remove_node_rules() {
     local zone_id="$1" domain="$2"
     local rules kept n nk r
     rules=$(cf_get_origin_rules "$zone_id")
-    kept=$(echo "$rules" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
+    # 语义级匹配：expression 里带引号精确引用本节点域名的规则（eq/==/列表写法通吃，
+    # 兼容旧版本脚本写入的规则式样；带引号匹配不会误伤前缀相似的其他子域名）
+    kept=$(echo "$rules" | jq --arg d "$domain" '[
         .[] | select(
-            (((.description // "") | startswith($pfx)) | not) or
-            (((.expression // "") | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"")) | not)
+            (((.expression // "") | ascii_downcase | contains("\"" + ($d|ascii_downcase) + "\""))) | not
         )
     ]')
     n=$(echo "$rules" | jq 'length')
     nk=$(echo "$kept" | jq 'length')
-    [[ "$n" == "$nk" ]] || return 0
+    if [[ "$n" == "$nk" ]]; then
+        info "Origin Rules 中未找到引用 ${domain} 的规则"
+        return 0
+    fi
     r=$(cf_call_raw PUT "/zones/$zone_id/rulesets/phases/http_request_origin/entrypoint" \
         "$(jq -n --argjson r "$kept" '{rules:$r}')")
     if echo "$r" | jq -e '.success' &>/dev/null; then
