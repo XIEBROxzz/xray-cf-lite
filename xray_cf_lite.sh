@@ -287,15 +287,41 @@ cf_get_dns() {
 
 cf_upsert_dns() {
     local zone_id="$1" domain="$2" ip="$3"
-    local payload existing
+    local payload all resp rec rtype rid fcontent
     payload=$(jq -n --arg n "$domain" --arg c "$ip" '{type:"A",name:$n,content:$c,proxied:true,ttl:1}')
-    existing=$(cf_get_dns "$zone_id" "$domain")
-    if [[ -n "$existing" ]]; then
-        local rid; rid=$(echo "$existing" | jq -r '.id')
-        cf_call PUT "/zones/${zone_id}/dns_records/${rid}" "$payload" | jq -r '.result.id'
-    else
-        cf_call POST "/zones/${zone_id}/dns_records" "$payload" | jq -r '.result.id'
+
+    # 同名现有记录（不限类型都要检查）：直接 POST 在有同名 CNAME/AAAA 时会被 CF 静默拒绝
+    all=$(cf_call_raw GET "/zones/${zone_id}/dns_records?name=${domain}&per_page=50" 2>/dev/null || true)
+
+    # 1) 已有 A 记录：更新内容即可
+    rec=$(echo "$all" | jq -r '.result[]? | select(.type=="A") | .id' 2>/dev/null | head -n1)
+    if [[ -n "$rec" ]]; then
+        resp=$(cf_call_raw PUT "/zones/${zone_id}/dns_records/${rec}" "$payload")
+        if ! echo "$resp" | jq -e '.success' >/dev/null 2>&1; then
+            die "更新 DNS A 记录失败: $(echo "$resp" | jq -c '.errors')"
+        fi
+        echo "$resp" | jq -r '.result.id'
+        return 0
     fi
+
+    # 2) 同名非 A 记录：以前 Argo 固定隧道残留的 CNAME (*.cfargotunnel.com) 自动替换；
+    #    其他来源的记录绝不擅动，明确报错由用户处理
+    while IFS=$'\t' read -r rtype rid fcontent; do
+        [[ -n "$rid" ]] || continue
+        if [[ "$rtype" == "CNAME" && "$fcontent" == *.cfargotunnel.com ]]; then
+            cf_call_raw DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null 2>&1 || true
+            info "已清理残留隧道 CNAME: ${domain} -> ${fcontent}"
+        else
+            die "无法创建 DNS 记录: ${domain} 已存在 ${rtype} 记录 (${fcontent})，请先到 CF 后台删除该同名记录后重试"
+        fi
+    done < <(echo "$all" | jq -r '.result[]? | [.type, .id, .content] | @tsv' 2>/dev/null)
+
+    # 3) 创建 A 记录（必须显式校验 success，失败明确报错退出）
+    resp=$(cf_call_raw POST "/zones/${zone_id}/dns_records" "$payload")
+    if ! echo "$resp" | jq -e '.success' >/dev/null 2>&1; then
+        die "创建 DNS 记录失败: $(echo "$resp" | jq -c '.errors')"
+    fi
+    echo "$resp" | jq -r '.result.id'
 }
 
 cf_get_ssl()  { cf_call GET "/zones/$1/settings/ssl" | jq -r '.result.value'; }
