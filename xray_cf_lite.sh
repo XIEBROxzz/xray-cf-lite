@@ -836,50 +836,95 @@ do_install() {
     echo "节点链接已保存到 $LAST_LINKS_PATH"
 }
 
-# ── 2. 卸载 ──────────────────────────────────────────
-do_uninstall() {
-    local state
-    state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到上次配置"
+# ── 删除节点核心清理（删除节点 / 卸载脚本 共用）──────
+# 注意：不改动 SSL 模式；DNS 记录只精确删除本节点域名的解析
+_delete_node_core() {
+    local state="$1"
+    local domain zone_id rids rid sec_bk
 
-    local domain; domain=$(echo "$state" | jq -r '.domain')
-    echo "正在卸载: $domain"
+    domain=$(echo "$state" | jq -r '.domain // ""')
 
-    stop_xray; rm -f "$XRAY_CONFIG_PATH"
+    stop_xray
+    rm -f "$XRAY_CONFIG_PATH"
     ok "xray 已停止"
 
-    if load_cf_account; then
-        local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id // ""')
-        if [[ -n "$zone_id" ]]; then
-            cf_put_origin_rules "$zone_id" "$(echo "$state" | jq '.origin_rules_backup // []')"
-            ok "Origin Rules 已恢复"
-
-            local ssl_bk; ssl_bk=$(echo "$state" | jq -r '.ssl_backup // ""')
-            [[ -n "$ssl_bk" ]] && cf_set_ssl "$zone_id" "$ssl_bk" && ok "SSL: $ssl_bk"
-
-            local dns_existed record_id
-            dns_existed=$(echo "$state" | jq -r '.dns_backup.existed')
-            record_id=$(echo "$state" | jq -r '.managed_dns_record_id // ""')
-            if [[ "$dns_existed" == "true" ]]; then
-                local rp; rp=$(echo "$state" | jq '.dns_backup.record | {type:(.type//"A"),name:(.name//""),content:(.content//""),proxied:(.proxied//false),ttl:(.ttl//1)}')
-                cf_call PUT "/zones/${zone_id}/dns_records/${record_id}" "$rp" >/dev/null
-                ok "DNS 已恢复"
-            elif [[ -n "$record_id" ]]; then
-                cf_call_raw DELETE "/zones/${zone_id}/dns_records/${record_id}" >/dev/null 2>&1 || true
-                ok "DNS 已删除"
-            fi
-            # 恢复安全规则
-            local sec_bk; sec_bk=$(echo "$state" | jq '.security_backup // null')
-            cf_restore_security "$zone_id" "$sec_bk"
-        fi
-    else
-        echo "无 CF 凭据，跳过恢复"
+    if ! load_cf_account; then
+        info "无 CF 凭据，跳过云端清理"
+        return 0
     fi
+
+    zone_id=$(echo "$state" | jq -r '.zone_id // ""')
+    if [[ -z "$zone_id" ]]; then
+        info "state 中无 zone_id，跳过云端清理"
+        return 0
+    fi
+
+    # 恢复 Origin Rules 备份
+    cf_put_origin_rules "$zone_id" "$(echo "$state" | jq '.origin_rules_backup // []')"
+    ok "Origin Rules 已恢复"
+
+    # 恢复安全规则（Bot Fight / Security Level / Browser Check），不动 SSL 模式
+    sec_bk=$(echo "$state" | jq '.security_backup // null')
+    cf_restore_security "$zone_id" "$sec_bk"
+
+    # DNS：精确匹配本节点域名（二级域名），同名记录（CNAME/A 等）全部删除
+    rids=$(cf_call_raw GET "/zones/${zone_id}/dns_records?name=${domain}" 2>/dev/null | jq -r '.result[]?.id // empty' || true)
+    if [[ -n "$rids" ]]; then
+        while IFS= read -r rid; do
+            [[ -n "$rid" ]] || continue
+            cf_call_raw DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null 2>&1 || true
+        done <<< "$rids"
+        ok "DNS 解析已删除: $domain"
+    else
+        info "未找到 $domain 的 DNS 记录"
+    fi
+}
+
+# ── 2. 删除节点 ──────────────────────────────────────
+do_delete_node() {
+    local state
+    state=$(load_state 2>/dev/null || true)
+    [[ -n "$state" ]] || die "未检测到已部署节点"
+
+    local domain; domain=$(echo "$state" | jq -r '.domain')
+    echo "正在删除节点: $domain"
+
+    _delete_node_core "$state"
 
     remove_state
     rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH" "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH" "$ORIGIN_CSR_PATH"
     ok "已清理节点快照与 CF 凭据"
-    ok "卸载完成"
+    ok "节点已删除 (SSL 模式未改动)"
+}
+
+# ── 0. 卸载脚本 ──────────────────────────────────────
+# 自动读取节点 -> 删除节点 -> 停止服务 -> 删除本地脚本文件
+do_uninstall_script() {
+    local state
+    state=$(load_state 2>/dev/null || true)
+
+    echo
+    read -rp "$(printf '\033[31m确定卸载脚本? 将自动删除已部署节点并自删脚本文件 (y/N): \033[0m')" confirm
+    [[ "${confirm,,}" =~ ^y(es)?$ ]] || { info "已取消"; return 0; }
+
+    if [[ -n "$state" ]]; then
+        info "检测到已部署节点，自动执行删除节点..."
+        _delete_node_core "$state"
+        remove_state
+        rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH" "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH" "$ORIGIN_CSR_PATH"
+    else
+        info "未检测到已部署节点，仅停止服务并清理"
+        stop_xray
+    fi
+
+    rm -rf "$STATE_DIR"
+    rm -f /usr/local/bin/x
+
+    local self
+    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    printf '\033[31m卸载完成，脚本文件已删除: %s\033[0m\n' "$self"
+    rm -f -- "$self" 2>/dev/null || true
+    exit 0
 }
 
 # ── 3. 查看节点 ──────────────────────────────────────
@@ -1235,7 +1280,7 @@ main() {
     echo "  xray-cf-lite ($INIT_SYSTEM)"
     echo
     echo "  1. 安装节点"
-    echo "  2. 卸载"
+    echo "  2. 删除节点"
     echo "  3. 查看节点/优选订阅"
     echo "  4. 修改配置(UUID/端口/路径)"
     echo "  5. 查看当前配置"
@@ -1244,12 +1289,15 @@ main() {
     echo "  8. 切换网络模式(直连/NAT)"
     [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
     echo
+    echo -e "\033[31m  0. 卸载脚本\033[0m"
+    echo
 
-    read -rp "请选择 [1-8]: " choice
+    read -rp "请选择 [0-8]: " choice
     case "$choice" in
-        1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
+        1) do_install ;; 2) do_delete_node ;; 3) do_show ;;
         4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
         7) do_restart ;; 8) do_switch_net_mode ;;
+        0) do_uninstall_script ;;
         *) die "无效选项: $choice" ;;
     esac
 }
