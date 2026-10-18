@@ -173,7 +173,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 ## 注意事项
 
 - 版本 A 安装时会暂时调整 Bot Fight Mode / Security Level / Browser Check
-- 版本 A 删除节点 / 卸载脚本只清理该节点自身：停止 xray、删本机配置、精确删除该二级域名的 DNS 解析、自动**吊销该域名的 CF Origin CA 证书**（新装节点按证书 ID 精确吊销，旧节点按 hostnames 匹配兜底，多域名的证书绝不会动）、**移除 Origin Rules 中该节点自己的规则**（实时拉取规则表→只剔除「本脚本创建且 host 等于该节点域名」的规则→回写，其他规则不受影响）、删本地证书文件；**完全不碰 zone 级全局配置（SSL 模式 / 安全规则），不影响同域名下其他节点**
+- 版本 A 删除节点 / 卸载脚本只清理该节点自身：停止 xray、删本机配置、精确删除该二级域名的 DNS 解析、自动**吊销该域名的 CF Origin CA 证书**（新装节点按证书 ID 精确吊销，旧节点按 hostnames 匹配兜底，多域名的证书绝不会动）、**移除 Origin Rules 中该节点自己的规则**（实时拉取规则表→按「expression 引用该节点域名」语义精确剔除，兼容旧版规则写法→回写，其他规则不受影响）、删本地证书文件；**完全不碰 zone 级全局配置（SSL 模式 / 安全规则），不影响同域名下其他节点**
 - Security Level / Browser Check / Bot Fight 为 zone 级全局设置，CF 不支持按二级域名单独生效，删除节点时状态保持不变
 - 一台服务器同时只支持一组部署（再次安装需先删除节点）
 - 两个版本的状态文件均可能包含 UUID、密码、Token，请勿公开上传
