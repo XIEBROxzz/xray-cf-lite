@@ -423,6 +423,33 @@ apply_origin_rules() {
     cf_put_origin_rules "$zone_id" "$merged"
 }
 
+# 删除节点专用：只移除「本脚本创建（description 带 xray-cf-lite 前缀）且
+# expression 目标 host 等于本节点域名」的 Origin Rule。
+# 匹配语义与 apply_origin_rules 完全一致；基于实时规则表过滤回写（不用旧备份），
+# 用户手工规则、其他节点的规则不受影响；失败不中断删除流程。
+cf_remove_node_rules() {
+    local zone_id="$1" domain="$2"
+    local rules kept n nk r
+    rules=$(cf_get_origin_rules "$zone_id")
+    kept=$(echo "$rules" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
+        .[] | select(
+            (.description | startswith($pfx) | not) or
+            (.expression | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"") | not)
+        )
+    ]')
+    n=$(echo "$rules" | jq 'length')
+    nk=$(echo "$kept" | jq 'length')
+    [[ "$n" == "$nk" ]] || return 0
+    r=$(cf_call_raw PUT "/zones/$zone_id/rulesets/phases/http_request_origin/entrypoint" \
+        "$(jq -n --argjson r "$kept" '{rules:$r}')")
+    if echo "$r" | jq -e '.success' &>/dev/null; then
+        ok "Origin Rules 已移除本节点规则 ($((n - nk)) 条)"
+    else
+        info "Origin Rules 清理失败，该节点规则可稍后在 CF 后台手动删除"
+    fi
+    return 0
+}
+
 # ── CF Origin 证书（Full Strict 用）──────────────────
 # 生成 key + CSR，调 CF API 签发 Origin 证书并保存到 STATE_DIR。
 # 证书由 CF 信任、有效期 15 年，无需续期；CF SSL 设 strict 时启用。
@@ -878,6 +905,10 @@ _delete_node_core() {
             else
                 info "未找到 $domain 的 DNS 记录"
             fi
+
+            # Origin Rules：只移除本脚本创建、且 host 为本节点域名的规则
+            # （实时拉取规则表→精准过滤→回写，不碰全局配置与其他节点的规则）
+            cf_remove_node_rules "$zone_id" "$domain" || true
         fi
     fi
 
