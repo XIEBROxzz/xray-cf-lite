@@ -446,6 +446,14 @@ cf_setup_origin_cert() {
     echo "$cert" > "$ORIGIN_CERT_PATH"
     chmod 600 "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH"
     rm -f "$ORIGIN_CSR_PATH"
+    # 保存证书 ID，删除节点/卸载时用于精确吊销 CF 账号侧证书
+    local cert_id
+    cert_id=$(echo "$r" | jq -r '.result.id // empty')
+    if [[ -n "$cert_id" ]]; then
+        [[ -d "$STATE_DIR" ]] || mkdir -p "$STATE_DIR"
+        printf '%s' "$cert_id" > "$STATE_DIR/origin_cert_id"
+        chmod 600 "$STATE_DIR/origin_cert_id" 2>/dev/null || true
+    fi
     ok "Origin 证书已保存: $ORIGIN_CERT_PATH"
 }
 
@@ -837,7 +845,8 @@ do_install() {
 }
 
 # ── 删除节点核心清理（删除节点 / 卸载脚本 共用）──────
-# 原则：只清理本节点自身（xray 服务、本机配置、本节点域名的 DNS 解析、本地证书文件）
+# 原则：只清理本节点自身（xray 服务、本机配置、本节点域名的 DNS 解析、
+#       本节点域名的 Origin CA 证书吊销、本地证书文件）
 # 不碰任何 zone 级全局配置：SSL 模式 / Origin Rules / 安全规则(Bot Fight 等)都不动，
 # 避免影响部署在同一域名下的其他节点。
 _delete_node_core() {
@@ -871,6 +880,37 @@ _delete_node_core() {
             fi
         fi
     fi
+
+    # 证书：吊销 CF 账号侧本节点的 Origin CA 证书（只碰 hostnames 恰好=本节点域名的证书）
+    # 新装节点：优先用安装时保存的证书 ID 精确吊销
+    # 旧节点：无 ID 时列出账号证书，按 hostnames 精确匹配兜底（多域名的证书绝不吊销）
+    local cert_id_path="$STATE_DIR/origin_cert_id"
+    local cert_id=""
+    [[ -f "$cert_id_path" ]] && cert_id=$(tr -d '[:space:]' < "$cert_id_path" 2>/dev/null)
+    if [[ -n "$cert_id" ]]; then
+        if cf_call_raw DELETE "/certificates/${cert_id}" >/dev/null 2>&1; then
+            ok "已吊销 Origin 证书 (id: ${cert_id})"
+        else
+            info "Origin 证书吊销失败或已吊销 (id: ${cert_id})，如需要可稍后在 CF 后台手动删除"
+        fi
+    else
+        local clist cid chosts
+        clist=$(cf_call_raw GET "/certificates?per_page=100" 2>/dev/null || true)
+        if [[ -n "$clist" ]] && echo "$clist" | jq -e '.result != null' >/dev/null 2>&1; then
+            while IFS=$'\t' read -r cid chosts; do
+                [[ -n "$cid" ]] || continue
+                [[ "$chosts" == "$domain" ]] || continue
+                if cf_call_raw DELETE "/certificates/${cid}" >/dev/null 2>&1; then
+                    ok "已吊销 Origin 证书: ${chosts}"
+                else
+                    info "Origin 证书吊销失败: ${chosts} (可稍后在 CF 后台手动删除)"
+                fi
+            done < <(echo "$clist" | jq -r '.result[]? | [.id, (.hostnames | join(","))] | @tsv' 2>/dev/null)
+        else
+            info "无法列出 CF 账号证书 (凭据权限不足)，该节点旧证书如需清理请到 CF 后台 SSL→源服务器 手动删除"
+        fi
+    fi
+    rm -f "$cert_id_path"
 
     # 本地证书文件（Origin 证书/私钥/CSR）随节点一起清理
     rm -f "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH" "$ORIGIN_CSR_PATH"
