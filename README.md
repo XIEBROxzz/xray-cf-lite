@@ -131,11 +131,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 
 ```
 1. 安装节点        部署 xray + 配置 CF（DNS/SSL/Origin Rules）+ 生成节点链接
-2. 卸载            停止 xray + 回滚 CF 配置 + 清理本地状态/凭据/证书
+2. 删除节点        停止 xray + 恢复 Origin Rules + 精确删除本节点 DNS 解析（不改动 SSL 模式）
 3. 查看节点        查看节点链接 / 生成优选订阅
 4. 修改配置        修改 UUID / 端口 / WS 路径
 5. 查看当前配置    显示域名、UUID、端口映射、xray 状态、节点链接
 6. 更新外部端口    NAT 换端口专用：只更新 CF Origin Rules，不重启 xray
+7. 重启 xray       / 8. 切换网络模式(直连/NAT)
+0. 卸载脚本        红字入口：自动删除已部署节点 -> 停止服务 -> 自删脚本文件
 ```
 
 ## 可选项（版本 A）
@@ -170,10 +172,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/
 
 ## 注意事项
 
-- 版本 A 安装时自动关闭 Bot Fight Mode / Security Level / Browser Check，卸载时恢复原值
-- 版本 A 卸载会完整回滚 CF 配置（DNS / SSL / Origin Rules），并清理本地状态、凭据、证书
+- 版本 A 安装时自动关闭 Bot Fight Mode / Security Level / Browser Check，删除节点/卸载时恢复原值
+- 版本 A 删除节点不改动 SSL 模式；DNS 解析严格精确到该节点的二级域名，只删该域名的记录
 - CF 凭据 / Token 只存在服务器本地，不会上传
-- 一台服务器同时只支持一组部署（再次安装需先卸载）
+- 一台服务器同时只支持一组部署（再次安装需先删除节点）
 - 两个版本的状态文件均可能包含 UUID、密码、Token，请勿公开上传
 
 ---
